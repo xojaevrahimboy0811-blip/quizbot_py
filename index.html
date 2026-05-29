@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Instant Quiz Maker</title>
+    <script src="https://telegram.org"></script>
+    <script src="https://cloudflare.com"></script>
+    <script src="https://cloudflare.com"></script>
+    <script>pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cloudflare.com';</script>
+    <style>
+        body { font-family: -apple-system, sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #000); padding: 16px; margin: 0; }
+        .card { background: var(--tg-theme-secondary-bg-color, #f4f4f7); padding: 20px; border-radius: 12px; margin-bottom: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        button { background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); border: none; padding: 14px; width: 100%; border-radius: 10px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        button:disabled { background: #ccc; color: #666; }
+        .option-btn { background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #000); margin: 8px 0; text-align: left; font-weight: normal; border: 1px solid rgba(0,0,0,0.1); width: 100%; }
+        .hidden { display: none; }
+        .loading-text { text-align: center; color: #777; font-style: italic; }
+    </style>
+</head>
+<body>
+
+    <!-- Upload Screen -->
+    <div class="card" id="upload-box">
+        <h2>📎 Test Faylini Yuklang</h2>
+        <p>PDF yoki .docx hujjatini tanlang.</p>
+        <input type="file" id="filePicker" accept=".pdf,.docx" style="margin-bottom:15px; width:100%;">
+        <button id="processBtn" onclick="readAndGenerate()">Testni Boshlash ✨</button>
+        <p class="loading-text hidden" id="statusMessage">📄 Matn ajratib olinmoqda...</p>
+    </div>
+
+    <!-- Quiz Screen -->
+    <div class="card hidden" id="quiz-box">
+        <div style="display:flex; justify-content:space-between; margin-bottom:10px; font-weight:bold;">
+            <span id="counter">Savol: 0/0</span>
+            <span id="score">Ball: 0</span>
+        </div>
+        <h3 id="question-display">Savol matni</h3>
+        <div id="options-box"></div>
+    </div>
+
+    <script>
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+
+        let quizData = [];
+        let index = 0;
+        let scoreCount = 0;
+        
+        // PASTE YOUR RENDER BACKEND URL HERE AFTER DEPLOYMENT
+        const SERVICE_URL = "https://onrender.com";
+
+        async function readAndGenerate() {
+            const picker = document.getElementById('filePicker');
+            if(!picker.files[0]) return alert("Fayl tanlanmadi!");
+
+            toggleLoader(true, "📄 Matn o'qilmoqda...");
+            const file = picker.files[0];
+            let rawText = "";
+
+            try {
+                if(file.name.endsWith('.pdf')) {
+                    const buf = await file.arrayBuffer();
+                    const pdf = await pdfjsLib.getDocument({data: buf}).promise;
+                    for(let i=1; i<=pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const content = await page.getTextContent();
+                        rawText += content.items.map(item => item.str).join(" ") + "\n";
+                    }
+                } else {
+                    const buf = await file.arrayBuffer();
+                    const res = await mammoth.extractRawText({arrayBuffer: buf});
+                    rawText = res.value;
+                }
+
+                if(!rawText.trim()) throw new Error("Hujjat bo'sh yoki o'qib bo'lmadi.");
+
+                toggleLoader(true, "🧠 AI savollarni tayyorlamoqda...");
+                const response = await fetch(SERVICE_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text: rawText.substring(0, 15000) })
+                });
+
+                quizData = await response.json();
+                if(quizData && quizData.length > 0) {
+                    startQuizEngine();
+                } else {
+                    throw new Error("AI savol topa olmadi.");
+                }
+            } catch(e) {
+                alert("Xatolik: " + e.message);
+                toggleLoader(false);
+            }
+        }
+
+        function startQuizEngine() {
+            index = 0; scoreCount = 0;
+            document.getElementById('upload-box').classList.add('hidden');
+            document.getElementById('quiz-box').classList.remove('hidden');
+            renderQuestion();
+        }
+
+        function renderQuestion() {
+            if(index >= quizData.length) {
+                document.getElementById('quiz-box').innerHTML = `<h2>🎉 Yakunlandi!</h2><p>Sizning natijangiz: <b>${scoreCount}/${quizData.length}</b></p>`;
+                return;
+            }
+            const current = quizData[index];
+            document.getElementById('counter').innerText = `Savol: ${index + 1}/${quizData.length}`;
+            document.getElementById('score').innerText = `Ball: ${scoreCount}`;
+            document.getElementById('question-display').innerText = current.question;
+
+            const box = document.getElementById('options-box');
+            box.innerHTML = "";
+
+            current.options.forEach((opt, idx) => {
+                const btn = document.createElement('button');
+                btn.className = "option-btn";
+                btn.innerText = opt;
+                btn.onclick = () => verifySelection(idx, current.correct_index, btn);
+                box.appendChild(btn);
+            });
+        }
+
+        function verifySelection(sel, correct, btn) {
+            if(sel === correct) {
+                btn.style.background = "#4caf50"; btn.style.color = "#fff";
+                scoreCount++;
+                if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('success');
+            } else {
+                btn.style.background = "#f44336"; btn.style.color = "#fff";
+                if(tg.HapticFeedback) tg.HapticFeedback.notificationOccurred('error');
+            }
+            setTimeout(() => { index++; renderQuestion(); }, 1200);
+        }
+
+        function toggleLoader(show, msg="") {
+            const btn = document.getElementById('processBtn');
+            const txt = document.getElementById('statusMessage');
+            btn.disabled = show;
+            if(show) { txt.innerText = msg; txt.classList.remove('hidden'); }
+            else { txt.classList.add('hidden'); }
+        }
+    </script>
+</body>
+</html>
