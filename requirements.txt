@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-google-genai
-pydantic
-python-telegram-bot
+python-telegram-bot>=21,<23
+pypdf>=5,<7
+python-docx>=1.1,<2
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
