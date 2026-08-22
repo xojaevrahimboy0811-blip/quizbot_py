@@ -8,6 +8,8 @@ from typing import List, Dict, Optional, Tuple
 
 from docx import Document
 from pypdf import PdfReader
+
+import database_quiz as db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -37,6 +39,7 @@ GROUP_SIZES = [30, 40, 50, 100]
 
 # Telegram supports timed polls. These are the study choices shown before Start.
 TIMER_CHOICES = [10, 15, 20, 30, 40, 60, 120]
+GROUP_EMPTY_STOP_THRESHOLD = 3
 
 
 def format_duration(seconds: int) -> str:
@@ -386,13 +389,14 @@ def group_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
+                InlineKeyboardButton("📚 Mening testlarim", callback_data="g_saved"),
                 InlineKeyboardButton("📄 Test yuklash", callback_data="g_new"),
-                InlineKeyboardButton("📚 Joriy test", callback_data="g_current"),
             ],
             [
+                InlineKeyboardButton("📚 Joriy test", callback_data="g_current"),
                 InlineKeyboardButton("🏆 Oxirgi reyting", callback_data="g_leaderboard"),
-                InlineKeyboardButton("❓ Yordam", callback_data="g_help"),
             ],
+            [InlineKeyboardButton("❓ Yordam", callback_data="g_help")],
         ]
     )
 
@@ -411,7 +415,8 @@ async def send_group_home(message):
         "Bir xil savol barcha qatnashchilarga beriladi. "
         "Javob berganlar ham vaqt tugaguncha kutadi. "
         "Keyingi savol faqat taymer tugagach chiqadi.\n\n"
-        "Testni boshqaruvchi foydalanuvchi PDF/DOCX faylini guruhga yuboradi.",
+        "Istalgan foydalanuvchi o‘zining saqlangan testini tanlashi yoki yangi PDF/DOCX yuborishi mumkin.\n\n"
+        "Boshqaruvchi buyruqlari: /stop va /skip",
         reply_markup=group_home_keyboard(),
     )
 
@@ -474,52 +479,160 @@ async def help_upload_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await send_new_quiz_prompt(query.message)
 
 
-async def show_current_quiz(message, user_id: int):
-    session = USER_DATA.get(user_id)
-    if not session:
+async def show_saved_quizzes(message, tg_user, group_mode: bool = False):
+    if not db.is_enabled():
+        # Database is optional during the transition; keep old RAM behavior usable.
+        session = GROUP_DATA.get(message.chat.id) if group_mode else USER_DATA.get(tg_user.id)
+        if session:
+            target = "g_current" if group_mode else "groups"
+            await message.reply_text(
+                "⚠️ Doimiy database hali ulanmagan. Hozirgi test faqat vaqtinchalik xotirada.\n\n"
+                f"📄 {session.get('filename', 'Test')}\n"
+                f"✅ {len(session.get('questions', []))} ta savol",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📚 Joriy test", callback_data=target)]]
+                ),
+            )
+        else:
+            await message.reply_text(
+                "⚠️ Doimiy database hali ulanmagan. Avval yangi test yuklang."
+            )
+        return
+
+    quizzes = await db.list_quizzes(tg_user.id, limit=20)
+    if not quizzes:
+        rows = []
+        if group_mode:
+            rows.append([InlineKeyboardButton("📄 Test yuklash", callback_data="g_new")])
+            rows.append([InlineKeyboardButton("🏠 Guruh menyusi", callback_data="g_home")])
+        else:
+            rows.append([InlineKeyboardButton("📄 Yangi test", callback_data="menu_new")])
+            rows.append([InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")])
+
         await message.reply_text(
-            "📚 Hozircha yuklangan test yo‘q.\n\n"
-            "Yangi PDF yoki DOCX yuboring.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("📄 Yangi test", callback_data="menu_new")],
-                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
-                ]
-            ),
+            "📚 Sizda hali saqlangan test yo‘q.\n\n"
+            "PDF/DOCX testni bir marta yuklasangiz, u keyingi safar shu yerda chiqadi.",
+            reply_markup=InlineKeyboardMarkup(rows),
         )
         return
 
-    filename = session.get("filename", "Test")
-    total = len(session.get("questions", []))
-    warnings = len(session.get("warnings", []))
+    rows = []
+    prefix = "gload" if group_mode else "pload"
+    for quiz in quizzes:
+        name = quiz["name"]
+        if len(name) > 32:
+            name = name[:29] + "..."
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📘 {name} · {quiz['question_count']}",
+                    callback_data=f"{prefix}:{quiz['id']}",
+                )
+            ]
+        )
 
-    buttons = []
-    if session.get("groups"):
-        buttons.append([InlineKeyboardButton("📚 Guruhlarni ochish", callback_data="groups")])
-    else:
-        buttons.extend(group_size_keyboard().inline_keyboard[:-1])
-
-    buttons.append([InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "🏠 Guruh menyusi" if group_mode else "🏠 Bosh menyu",
+                callback_data="g_home" if group_mode else "menu_home",
+            )
+        ]
+    )
 
     await message.reply_text(
-        f"📚 Joriy test\n\n"
-        f"📄 {filename}\n"
-        f"✅ Quizga tayyor: {total}\n"
-        f"⚠️ Muammoli: {warnings}\n\n"
-        "Eslatma: doimiy saqlash bazasi hali qo‘shilmagan. "
-        "Hozircha bu test Render qayta ishga tushmaguncha xotirada turadi.",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        "📚 Saqlangan testlaringiz\n\nBoshlash uchun testni tanlang:",
+        reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
 async def quizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await show_current_quiz(update.message, update.effective_user.id)
+    await show_saved_quizzes(
+        update.message,
+        update.effective_user,
+        group_mode=is_group_chat(update.effective_chat),
+    )
 
 
 async def quizzes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await show_current_quiz(query.message, update.effective_user.id)
+    await show_saved_quizzes(query.message, update.effective_user, group_mode=False)
+
+
+async def group_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await show_saved_quizzes(query.message, update.effective_user, group_mode=True)
+
+
+async def private_load_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not db.is_enabled():
+        await query.message.reply_text("❌ Database ulanmagan.")
+        return
+
+    quiz_id = int(query.data.split(":")[1])
+    quiz = await db.load_quiz(update.effective_user.id, quiz_id)
+    if not quiz:
+        await query.message.reply_text("❌ Test topilmadi yoki sizga tegishli emas.")
+        return
+
+    USER_DATA[update.effective_user.id] = {
+        "chat_id": update.effective_chat.id,
+        "filename": quiz["source_filename"],
+        "questions": quiz["questions"],
+        "warnings": [],
+        "group_size": None,
+        "groups": [],
+        "active": None,
+        "results": {},
+        "saved_quiz_id": quiz_id,
+    }
+
+    await query.message.reply_text(
+        f"📘 {quiz['name']}\n"
+        f"✅ {len(quiz['questions'])} ta savol yuklandi.\n\n"
+        "Har bir guruhda nechta savol bo‘lsin?",
+        reply_markup=group_size_keyboard(group_mode=False),
+    )
+
+
+async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not db.is_enabled():
+        await query.message.reply_text("❌ Database ulanmagan.")
+        return
+
+    quiz_id = int(query.data.split(":")[1])
+    quiz = await db.load_quiz(update.effective_user.id, quiz_id)
+    if not quiz:
+        await query.message.reply_text("❌ Test topilmadi yoki sizga tegishli emas.")
+        return
+
+    GROUP_DATA[update.effective_chat.id] = {
+        "chat_id": update.effective_chat.id,
+        "filename": quiz["source_filename"],
+        "questions": quiz["questions"],
+        "warnings": [],
+        "group_size": None,
+        "groups": [],
+        "active": None,
+        "results": {},
+        "controller_id": update.effective_user.id,
+        "last_leaderboard_text": None,
+        "saved_quiz_id": quiz_id,
+    }
+
+    await query.message.reply_text(
+        f"✅ {update.effective_user.full_name} o‘z testini tanladi.\n\n"
+        f"📘 {quiz['name']}\n"
+        f"❓ {len(quiz['questions'])} ta savol\n\n"
+        "Har bir bo‘limda nechta savol bo‘lsin?",
+        reply_markup=group_size_keyboard(group_mode=True),
+    )
 
 
 async def show_continue(message, user_id: int):
@@ -721,7 +834,10 @@ async def group_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         "4) Vaqtni tanlang.\n"
         "5) ▶️ START ni bosing.\n\n"
         "Savol vaqt tugaguncha ochiq turadi. Hamma shu vaqt ichida javob beradi. "
-        "Keyingi savol avtomatik ravishda vaqt tugagach chiqadi.",
+        "Keyingi savol avtomatik ravishda vaqt tugagach chiqadi.\n\n"
+        "🛑 /stop — quizni natija bilan tugatish\n"
+        "⏭ /skip — joriy savolni o‘tkazish\n"
+        f"😴 {GROUP_EMPTY_STOP_THRESHOLD} ta ketma-ket savolga hech kim javob bermasa, bot o‘zi to‘xtaydi.",
         reply_markup=group_home_keyboard(),
     )
 
@@ -833,6 +949,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             USER_DATA[user_id] = session_data
 
+        saved_note = ""
+        if db.is_enabled():
+            try:
+                saved_id = await db.save_quiz(
+                    owner_id=user_id,
+                    username=update.effective_user.username,
+                    full_name=update.effective_user.full_name,
+                    filename=filename,
+                    questions=questions,
+                )
+                session_data["saved_quiz_id"] = saved_id
+                saved_note = "\n💾 Test doimiy bazaga saqlandi."
+            except Exception:
+                logging.exception("Could not save quiz to database")
+                saved_note = "\n⚠️ Test ishlaydi, lekin bazaga saqlashda xato bo‘ldi."
 
         total_blocks = len(questions) + len(warnings)
 
@@ -860,7 +991,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🧩 Savol bloklari topildi: {total_blocks}\n"
             f"✅ Quizga tayyor: {len(questions)}"
             f"{warning_text}"
-            f"{mode_note}\n\n"
+            f"{mode_note}"
+            f"{saved_note}\n\n"
             f"Har bir guruhda nechta savol bo‘lsin?",
             reply_markup=group_size_keyboard(group_mode=group_mode),
         )
@@ -1614,6 +1746,9 @@ async def group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "timer_seconds": timer_seconds,
         "participants": {},
         "answered_users": set(),
+        "empty_streak": 0,
+        "current_poll_id": None,
+        "current_poll_message_id": None,
     }
 
     try:
@@ -1673,9 +1808,13 @@ async def send_next_group_question(chat_id: int, context: ContextTypes.DEFAULT_T
         await send_next_group_question(chat_id, context)
         return
 
+    active["current_poll_id"] = msg.poll.id
+    active["current_poll_message_id"] = msg.message_id
+
     POLL_MAP[msg.poll.id] = {
         "mode": "group",
         "chat_id": chat_id,
+        "message_id": msg.message_id,
         "group_index": active["group_index"],
         "question_index": idx,
         "run_id": active["run_id"],
@@ -1786,19 +1925,44 @@ async def group_question_timeout(
         return
 
     meta["handled"] = True
+
+    answered_count = len(active.get("answered_users", set()))
+    if answered_count == 0:
+        active["empty_streak"] = active.get("empty_streak", 0) + 1
+    else:
+        active["empty_streak"] = 0
+
     active["current"] += 1
+    active["current_poll_id"] = None
+    active["current_poll_message_id"] = None
     POLL_MAP.pop(poll_id, None)
+
+    if active["empty_streak"] >= GROUP_EMPTY_STOP_THRESHOLD:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"😴 Oxirgi {GROUP_EMPTY_STOP_THRESHOLD} ta savolga hech kim javob bermadi.\n"
+                "Quiz avtomatik to‘xtatildi va hozirgacha bo‘lgan natija chiqariladi."
+            ),
+        )
+        await finish_group_quiz(
+            chat_id,
+            context,
+            completed_count=active["current"],
+            stopped_reason="no_answers",
+        )
+        return
 
     await send_next_group_question(chat_id, context)
 
 
-async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, completed_count: Optional[int] = None, stopped_reason: Optional[str] = None):
     session = GROUP_DATA.get(chat_id)
     if not session or not session.get("active"):
         return
 
     active = session["active"]
-    total = len(active["questions"])
+    total = completed_count if completed_count is not None else len(active["questions"])
     group_index = active["group_index"]
     timer_seconds = active["timer_seconds"]
     participants = active["participants"]
@@ -1828,15 +1992,19 @@ async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
+    finish_title = "🛑 GURUH QUIZI TO‘XTATILDI" if stopped_reason else "🏆 GURUH QUIZI TUGADI"
     lines = [
-        "🏆 GURUH QUIZI TUGADI",
+        finish_title,
         "",
         f"📘 Bo‘lim: {group_index + 1}",
         f"❓ Savollar: {total}",
         f"👥 Qatnashchilar: {len(ranking)}",
-        "",
-        "🏅 Reyting:",
     ]
+    if stopped_reason == "manual":
+        lines.append("🛑 Boshqaruvchi quizni to‘xtatdi.")
+    elif stopped_reason == "no_answers":
+        lines.append("😴 Faollik bo‘lmagani uchun avtomatik to‘xtadi.")
+    lines.extend(["", "🏅 Reyting:"])
 
     medals = ["🥇", "🥈", "🥉"]
     for pos, row in enumerate(ranking[:20], start=1):
@@ -1886,6 +2054,134 @@ async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         text=leaderboard_text,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+
+
+async def stop_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_group_chat(update.effective_chat):
+        await update.message.reply_text("/stop faqat guruh quizida ishlaydi.")
+        return
+
+    session = GROUP_DATA.get(update.effective_chat.id)
+    if not session or not session.get("active"):
+        await update.message.reply_text("🛑 Hozir faol guruh quizi yo‘q.")
+        return
+    if update.effective_user.id != session.get("controller_id"):
+        await update.message.reply_text("⛔ Quizni faqat uni boshlagan boshqaruvchi to‘xtata oladi.")
+        return
+
+    await update.message.reply_text(
+        "⚠️ Quizni hozir to‘xtatamizmi? Hozirgacha bo‘lgan natija saqlanadi.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🛑 Ha, to‘xtat", callback_data="gstop_yes")],
+                [InlineKeyboardButton("← Bekor qilish", callback_data="gstop_no")],
+            ]
+        ),
+    )
+
+
+async def group_stop_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Davom etadi")
+    await query.message.reply_text("▶️ Quiz davom etmoqda.")
+
+
+async def group_stop_yes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = GROUP_DATA.get(update.effective_chat.id)
+    if not session or not session.get("active"):
+        await query.answer("Faol quiz yo‘q", show_alert=True)
+        return
+    if update.effective_user.id != session.get("controller_id"):
+        await query.answer("Faqat quiz boshqaruvchisi to‘xtata oladi.", show_alert=True)
+        return
+    await query.answer()
+
+    active = session["active"]
+    poll_id = active.get("current_poll_id")
+    message_id = active.get("current_poll_message_id")
+
+    if poll_id:
+        meta = POLL_MAP.get(poll_id)
+        if meta:
+            meta["handled"] = True
+        POLL_MAP.pop(poll_id, None)
+
+    if message_id:
+        try:
+            await context.bot.stop_poll(update.effective_chat.id, message_id)
+        except Exception:
+            pass
+
+    # The currently visible question counts as seen.
+    completed = min(active["current"] + (1 if message_id else 0), len(active["questions"]))
+    active["current_poll_id"] = None
+    active["current_poll_message_id"] = None
+
+    await finish_group_quiz(
+        update.effective_chat.id,
+        context,
+        completed_count=completed,
+        stopped_reason="manual",
+    )
+
+
+async def skip_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_group_chat(update.effective_chat):
+        await update.message.reply_text("/skip faqat guruh quizida ishlaydi.")
+        return
+
+    session = GROUP_DATA.get(update.effective_chat.id)
+    if not session or not session.get("active"):
+        await update.message.reply_text("⏭ Hozir faol guruh quizi yo‘q.")
+        return
+    if update.effective_user.id != session.get("controller_id"):
+        await update.message.reply_text("⛔ Savolni faqat quiz boshqaruvchisi o‘tkaza oladi.")
+        return
+
+    active = session["active"]
+    poll_id = active.get("current_poll_id")
+    message_id = active.get("current_poll_message_id")
+    if not poll_id or not message_id:
+        await update.message.reply_text("⏭ Hozir o‘tkazib yuboriladigan savol yo‘q.")
+        return
+
+    meta = POLL_MAP.get(poll_id)
+    if meta:
+        meta["handled"] = True
+    POLL_MAP.pop(poll_id, None)
+
+    try:
+        await context.bot.stop_poll(update.effective_chat.id, message_id)
+    except Exception:
+        pass
+
+    active["current"] += 1
+    active["empty_streak"] = 0
+    active["current_poll_id"] = None
+    active["current_poll_message_id"] = None
+
+    await update.message.reply_text("⏭ Savol o‘tkazib yuborildi.")
+    await send_next_group_question(update.effective_chat.id, context)
+
+
+async def db_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = "✅ Database ulangan" if db.is_enabled() else "❌ Database ulanmagan"
+    await update.message.reply_text(status)
+
+
+async def app_post_init(application: Application):
+    try:
+        await db.init_pool()
+    except Exception:
+        logging.exception("Database initialization failed")
+
+
+async def app_post_shutdown(application: Application):
+    try:
+        await db.close_pool()
+    except Exception:
+        logging.exception("Database shutdown failed")
 
 
 async def retry_wrong_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1946,7 +2242,13 @@ def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN environment variable is missing.")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(app_post_init)
+        .post_shutdown(app_post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new_command))
@@ -1956,6 +2258,9 @@ def main():
     app.add_handler(CommandHandler("group", group_mode_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stop", stop_group_command))
+    app.add_handler(CommandHandler("skip", skip_group_command))
+    app.add_handler(CommandHandler("dbstatus", db_status_command))
     app.add_handler(
         MessageHandler(
             filters.Document.PDF
@@ -1966,6 +2271,11 @@ def main():
 
     app.add_handler(CallbackQueryHandler(home_callback, pattern=r"^menu_home$"))
     app.add_handler(CallbackQueryHandler(group_home_callback, pattern=r"^g_home$"))
+    app.add_handler(CallbackQueryHandler(group_saved_callback, pattern=r"^g_saved$"))
+    app.add_handler(CallbackQueryHandler(private_load_saved_callback, pattern=r"^pload:\d+$"))
+    app.add_handler(CallbackQueryHandler(group_load_saved_callback, pattern=r"^gload:\d+$"))
+    app.add_handler(CallbackQueryHandler(group_stop_yes_callback, pattern=r"^gstop_yes$"))
+    app.add_handler(CallbackQueryHandler(group_stop_no_callback, pattern=r"^gstop_no$"))
     app.add_handler(CallbackQueryHandler(group_new_callback, pattern=r"^g_new$"))
     app.add_handler(CallbackQueryHandler(group_current_callback, pattern=r"^g_current$"))
     app.add_handler(CallbackQueryHandler(group_leaderboard_callback, pattern=r"^g_leaderboard$"))
