@@ -79,12 +79,20 @@ def extract_docx(data: bytes) -> str:
 # -----------------------------
 # TEST PARSER
 # -----------------------------
-QUESTION_RE = re.compile(r"^\s*(\d{1,4})\s*[\.\)\-:]\s*(.+?)\s*$")
+# The parser is deliberately tolerant about QUESTION NUMBER formatting.
+# These all count as the same kind of question start:
+#   № 123. Question
+#   №123. Question
+#   № 123.Question
+#   № 123 Question
+#   123. Question
+#   123) Question
+# Correct answers are still taken only from explicit answer information.
 OPTION_RE = re.compile(
-    r"^\s*([A-Ha-h])\s*[\.\)\-:]\s*(.+?)\s*$"
+    r"^\s*([+*✓✔✅☑]?)\s*([A-Ha-h])\s*[\.\)\-:]\s*(.+?)\s*$"
 )
-INLINE_ANSWER_RE = re.compile(
-    r"^\s*(?:answer|correct\s*answer|javob|to['’`ʻ]?g['’`ʻ]?ri\s*javob)\s*[:\-]?\s*([A-Ha-h])\b",
+ANSWER_LINE_RE = re.compile(
+    r"^\s*(?:answer|correct\s*answer|javob|to['’`ʻ]?g['’`ʻ]?ri\s*javob)\s*[:\-]?\s*(.*?)\s*$",
     re.IGNORECASE,
 )
 ANSWER_KEY_PAIR_RE = re.compile(
@@ -96,10 +104,50 @@ def normalize_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u00a0", " ")
     text = text.replace("–", "-").replace("—", "-")
-    # Split some common cases where PDF extraction joins items on one line.
-    text = re.sub(r"\s+(?=\d{1,4}[\.\)]\s+)", "\n", text)
-    text = re.sub(r"\s+(?=[A-Ha-h][\.\)]\s+)", "\n", text)
+
+    # IMPORTANT:
+    # Do NOT globally split before patterns such as "D. ...". In teacher-made
+    # documents this is often an author's initial (e.g. "Quronov D.") rather
+    # than answer option D. Splitting it used to break otherwise valid questions.
     return text
+
+
+def parse_question_start(line: str) -> Optional[Tuple[int, str]]:
+    """Recognize a numbered question without caring about missing spaces/dots."""
+    s = line.strip()
+
+    # №-style numbering: punctuation after the number is optional.
+    # Examples: №123, № 123., № 123.Question, № 123 Question
+    m = re.match(r"^№\s*(\d{1,4})\s*[\.\)\-:]?\s*(.*)$", s, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), m.group(2).strip()
+
+    # Plain numbering: punctuation is expected, but spacing is optional.
+    # Examples: 123.Question, 123. Question, 123) Question
+    m = re.match(r"^(\d{1,4})\s*([\.\)\-:])\s*(.*)$", s)
+    if m:
+        return int(m.group(1)), m.group(3).strip()
+
+    # A number on its own can also introduce a question on the next line.
+    m = re.match(r"^(\d{1,4})\s*$", s)
+    if m:
+        return int(m.group(1)), ""
+
+    return None
+
+
+def is_source_header(text: str) -> bool:
+    """Return True when the text after the question number is source metadata."""
+    cleaned = re.sub(r"^\s*#\s*", "", text).strip().lower()
+    return cleaned.startswith("manba") or cleaned.startswith("source")
+
+
+def clean_question_line(line: str) -> str:
+    """Remove harmless teacher markers without changing the actual question."""
+    s = line.strip()
+    if s in {"#", "=", "*", "+", "-"}:
+        return ""
+    return re.sub(r"^\s*#\s*", "", s).strip()
 
 
 def parse_answer_key(text: str) -> Dict[int, str]:
@@ -128,13 +176,10 @@ def parse_answer_key(text: str) -> Dict[int, str]:
         if pos > start:
             start = pos
 
-    candidate = text[start:] if start >= 0 else text
-
-    # Avoid accidentally interpreting normal question lines as answer keys
-    # unless the file contains a recognizable answer-key heading.
     if start < 0:
         return answers
 
+    candidate = text[start:]
     for num, letter in ANSWER_KEY_PAIR_RE.findall(candidate):
         answers[int(num)] = letter.upper()
 
@@ -143,17 +188,11 @@ def parse_answer_key(text: str) -> Dict[int, str]:
 
 def parse_questions(text: str) -> Tuple[List[dict], List[str]]:
     """
-    Parses common test formats:
-      1. Question
-      A) option
-      B) option
-      C) option
-      D) option
-      Answer: B
+    Flexible question detection + strict answer validation.
 
-    or an answer key at the end:
-      Javoblar:
-      1-B 2-A 3-D ...
+    The parser tolerates missing spaces and punctuation around question numbers,
+    but it NEVER guesses a correct answer. If the answer is missing or multiple
+    answers are explicitly supplied, that block is reported as a warning.
     """
     text = normalize_text(text)
     answer_key = parse_answer_key(text)
@@ -166,7 +205,7 @@ def parse_questions(text: str) -> Tuple[List[dict], List[str]]:
     current_option_letter: Optional[str] = None
 
     def save_current():
-        nonlocal current
+        nonlocal current, current_option_letter
         if not current:
             return
 
@@ -174,13 +213,27 @@ def parse_questions(text: str) -> Tuple[List[dict], List[str]]:
         options = current["options"]
         letter_to_index = current["letter_to_index"]
 
-        answer_letter = current.get("answer_letter") or answer_key.get(number)
-        correct_index = None
-        if answer_letter:
-            correct_index = letter_to_index.get(answer_letter.upper())
+        answer_letters = list(current.get("answer_letters") or [])
+        if not answer_letters and number in answer_key:
+            answer_letters = [answer_key[number]]
 
-        # Only accept Telegram-compatible multiple-choice questions.
-        if current["question"].strip() and 2 <= len(options) <= 10 and correct_index is not None:
+        correct_index = None
+        if len(answer_letters) == 1:
+            correct_index = letter_to_index.get(answer_letters[0])
+
+        reasons = []
+        if not current["question"].strip():
+            reasons.append("question text missing")
+        if not (2 <= len(options) <= 10):
+            reasons.append(f"{len(options)} options")
+        if len(answer_letters) == 0:
+            reasons.append("correct answer not found")
+        elif len(answer_letters) > 1:
+            reasons.append("multiple correct answers: " + ", ".join(answer_letters))
+        elif correct_index is None:
+            reasons.append(f"answer {answer_letters[0]} has no matching option")
+
+        if not reasons:
             questions.append(
                 {
                     "number": number,
@@ -190,34 +243,34 @@ def parse_questions(text: str) -> Tuple[List[dict], List[str]]:
                 }
             )
         else:
-            reason = []
-            if not current["question"].strip():
-                reason.append("question text missing")
-            if not (2 <= len(options) <= 10):
-                reason.append(f"{len(options)} options")
-            if correct_index is None:
-                reason.append("correct answer not found")
-            warnings.append(f"Question {number}: " + ", ".join(reason))
+            warnings.append(f"Question {number}: " + ", ".join(reasons))
 
         current = None
+        current_option_letter = None
 
     for line in lines:
-        q_match = QUESTION_RE.match(line)
+        q_start = parse_question_start(line)
         opt_match = OPTION_RE.match(line)
-        ans_match = INLINE_ANSWER_RE.match(line)
+        ans_match = ANSWER_LINE_RE.match(line)
 
-        if q_match:
-            # If this looks like an answer-key line (e.g. "1. B"), skip it.
-            if len(q_match.group(2).strip()) == 1 and q_match.group(2).strip().upper() in "ABCDEFGH":
+        # A numbered question start always wins over normal continuation text.
+        # OPTION_RE is checked only to avoid treating something like "A) ..." as
+        # a numeric question in unusual documents.
+        if q_start and not opt_match:
+            number, tail = q_start
+
+            # Skip answer-key-style lines such as "1. B".
+            if len(tail) == 1 and tail.upper() in "ABCDEFGH":
                 continue
 
             save_current()
             current = {
-                "number": int(q_match.group(1)),
-                "question": q_match.group(2).strip(),
+                "number": number,
+                # "№ 1. Manba: ..." is metadata; the real question follows.
+                "question": "" if is_source_header(tail) else clean_question_line(tail),
                 "options": [],
                 "letter_to_index": {},
-                "answer_letter": None,
+                "answer_letters": [],
             }
             current_option_letter = None
             continue
@@ -225,32 +278,50 @@ def parse_questions(text: str) -> Tuple[List[dict], List[str]]:
         if current is None:
             continue
 
+        # Explicit answer line. Capture the WHOLE value so "Javob: B, D" is
+        # recognized as ambiguous instead of silently choosing B.
         if ans_match:
-            current["answer_letter"] = ans_match.group(1).upper()
+            letters = [
+                x.upper()
+                for x in re.findall(r"\b([A-Ha-h])\b", ans_match.group(1))
+            ]
+            current["answer_letters"] = list(dict.fromkeys(letters))
             current_option_letter = None
             continue
 
         if opt_match:
-            letter = opt_match.group(1).upper()
-            option_text = opt_match.group(2).strip()
+            marker = opt_match.group(1)
+            letter = opt_match.group(2).upper()
+            option_text = opt_match.group(3).strip()
 
-            # Support a trailing * as a correct-answer marker:
-            # A) Paris *
-            is_marked_correct = option_text.endswith("*")
-            if is_marked_correct:
+            # Conservative support for common teacher correct-answer markers:
+            # +A) ..., *B) ..., ✓C) ..., ✔D) ...
+            if marker:
+                if letter not in current["answer_letters"]:
+                    current["answer_letters"].append(letter)
+
+            # Keep compatibility with the earlier "A) option *" convention.
+            if option_text.endswith("*"):
                 option_text = option_text[:-1].rstrip()
-                current["answer_letter"] = letter
+                if letter not in current["answer_letters"]:
+                    current["answer_letters"].append(letter)
 
             current["letter_to_index"][letter] = len(current["options"])
             current["options"].append(option_text)
             current_option_letter = letter
             continue
 
-        # Continuation lines:
+        # Continuation lines. A leading # is a common teacher marker for the
+        # question itself and should not become part of the visible Telegram text.
         if current_option_letter and current["options"]:
             current["options"][-1] += " " + line
         else:
-            current["question"] += " " + line
+            q_line = clean_question_line(line)
+            if q_line:
+                if current["question"]:
+                    current["question"] += " " + q_line
+                else:
+                    current["question"] = q_line
 
     save_current()
     return questions, warnings
@@ -262,25 +333,292 @@ def parse_questions(text: str) -> Tuple[List[dict], List[str]]:
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📄 Upload PDF/DOCX", callback_data="help_upload")],
+            [
+                InlineKeyboardButton("📚 Testlarim", callback_data="menu_quizzes"),
+                InlineKeyboardButton("📄 Yangi test", callback_data="menu_new"),
+            ],
+            [
+                InlineKeyboardButton("▶️ Davom etish", callback_data="menu_continue"),
+                InlineKeyboardButton("📊 Natijalar", callback_data="menu_progress"),
+            ],
+            [
+                InlineKeyboardButton("👥 Guruh testi", callback_data="menu_group"),
+                InlineKeyboardButton("⚙️ Sozlamalar", callback_data="menu_settings"),
+            ],
+            [
+                InlineKeyboardButton("❓ Yordam", callback_data="menu_help"),
+            ],
         ]
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Xush kelibsiz!\n\n"
-        "PDF yoki Word (.docx) test faylini yuboring.\n"
-        "Men savollarni topaman, keyin siz 30 / 40 / 50 / 100 savoldan guruhlarga ajratasiz.\n\n"
-        "Quiz avtomatik boshlanmaydi — tayyor bo‘lgach, siz ▶️ Start tugmasini bosasiz.",
+def home_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")]]
+    )
+
+
+def group_size_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("30", callback_data="size:30"),
+                InlineKeyboardButton("40", callback_data="size:40"),
+            ],
+            [
+                InlineKeyboardButton("50", callback_data="size:50"),
+                InlineKeyboardButton("100", callback_data="size:100"),
+            ],
+            [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
+        ]
+    )
+
+
+async def send_home(message):
+    await message.reply_text(
+        "🎓 Exam Quiz Bot\n\n"
+        "Kerakli bo‘limni tanlang:",
         reply_markup=main_menu(),
     )
 
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_home(update.message)
+
+
+async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_home(query.message)
+
+
+async def send_new_quiz_prompt(message):
+    await message.reply_text(
+        "📄 Yangi test\n\n"
+        "PDF yoki Word (.docx) test faylini shu chatga yuboring.\n"
+        "Men savollarni aniqlayman va keyin ularni 30 / 40 / 50 / 100 savoldan "
+        "guruhlarga ajratishga imkon beraman.",
+        reply_markup=home_button(),
+    )
+
+
+async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_new_quiz_prompt(update.message)
+
+
+async def new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_new_quiz_prompt(query.message)
+
+
+# Keep the old callback name because other parts of the bot already use it.
 async def help_upload_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("📎 Endi PDF yoki DOCX faylingizni shu chatga yuboring.")
+    await send_new_quiz_prompt(query.message)
+
+
+async def show_current_quiz(message, user_id: int):
+    session = USER_DATA.get(user_id)
+    if not session:
+        await message.reply_text(
+            "📚 Hozircha yuklangan test yo‘q.\n\n"
+            "Yangi PDF yoki DOCX yuboring.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("📄 Yangi test", callback_data="menu_new")],
+                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
+                ]
+            ),
+        )
+        return
+
+    filename = session.get("filename", "Test")
+    total = len(session.get("questions", []))
+    warnings = len(session.get("warnings", []))
+
+    buttons = []
+    if session.get("groups"):
+        buttons.append([InlineKeyboardButton("📚 Guruhlarni ochish", callback_data="groups")])
+    else:
+        buttons.extend(group_size_keyboard().inline_keyboard[:-1])
+
+    buttons.append([InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")])
+
+    await message.reply_text(
+        f"📚 Joriy test\n\n"
+        f"📄 {filename}\n"
+        f"✅ Quizga tayyor: {total}\n"
+        f"⚠️ Muammoli: {warnings}\n\n"
+        "Eslatma: doimiy saqlash bazasi hali qo‘shilmagan. "
+        "Hozircha bu test Render qayta ishga tushmaguncha xotirada turadi.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def quizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_current_quiz(update.message, update.effective_user.id)
+
+
+async def quizzes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await show_current_quiz(query.message, update.effective_user.id)
+
+
+async def show_continue(message, user_id: int):
+    session = USER_DATA.get(user_id)
+    if not session:
+        await message.reply_text(
+            "▶️ Davom ettirish uchun faol test topilmadi.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("📄 Yangi test", callback_data="menu_new")],
+                    [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
+                ]
+            ),
+        )
+        return
+
+    if session.get("active"):
+        active = session["active"]
+        await message.reply_text(
+            f"▶️ Quiz hozir davom etmoqda.\n\n"
+            f"Guruh: {active['group_index'] + 1}\n"
+            f"Savol: {active['current'] + 1}/{len(active['questions'])}\n\n"
+            "Joriy Telegram polliga javob bering yoki vaqt tugashini kuting.",
+            reply_markup=home_button(),
+        )
+        return
+
+    if session.get("groups"):
+        await show_groups(message, user_id)
+        return
+
+    await message.reply_text(
+        "▶️ Test yuklangan, lekin guruh hajmi hali tanlanmagan.\n\n"
+        "Har bir guruhda nechta savol bo‘lsin?",
+        reply_markup=group_size_keyboard(),
+    )
+
+
+async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_continue(update.message, update.effective_user.id)
+
+
+async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await show_continue(query.message, update.effective_user.id)
+
+
+async def show_progress(message, user_id: int):
+    session = USER_DATA.get(user_id)
+    if not session:
+        await message.reply_text(
+            "📊 Hozircha natijalar yo‘q.",
+            reply_markup=home_button(),
+        )
+        return
+
+    results = session.get("results", {})
+    if not results:
+        await message.reply_text(
+            "📊 Hozircha tugallangan guruh natijalari yo‘q.",
+            reply_markup=home_button(),
+        )
+        return
+
+    lines = ["📊 Natijalar\n"]
+    for idx in sorted(results):
+        result = results[idx]
+        unanswered = result.get("unanswered", 0)
+        lines.append(
+            f"📘 {idx + 1}-guruh — {result['correct']}/{result['total']} "
+            f"({result['percent']}%)"
+            + (f" · javobsiz {unanswered}" if unanswered else "")
+        )
+
+    await message.reply_text(
+        "\n".join(lines),
+        reply_markup=home_button(),
+    )
+
+
+async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_progress(update.message, update.effective_user.id)
+
+
+async def progress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await show_progress(query.message, update.effective_user.id)
+
+
+async def send_group_mode_info(message):
+    await message.reply_text(
+        "👥 Guruh testi\n\n"
+        "Bu bo‘lim keyingi bosqichda qo‘shiladi: bir xil savol barcha qatnashchilarga "
+        "beriladi, hamma tanlangan vaqt tugaguncha kutadi va yakunda reyting chiqadi.\n\n"
+        "Hozir individual quiz rejimi ishlaydi.",
+        reply_markup=home_button(),
+    )
+
+
+async def group_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_group_mode_info(update.message)
+
+
+async def group_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_group_mode_info(query.message)
+
+
+async def send_settings(message):
+    await message.reply_text(
+        "⚙️ Sozlamalar\n\n"
+        "Hozir vaqt har bir guruhni boshlashdan oldin tanlanadi:\n"
+        "10 / 15 / 20 / 30 / 40 / 60 soniya yoki 2 daqiqa.\n\n"
+        "Doimiy standart sozlamalar keyinroq qo‘shiladi.",
+        reply_markup=home_button(),
+    )
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_settings(update.message)
+
+
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_settings(query.message)
+
+
+async def send_help(message):
+    await message.reply_text(
+        "❓ Yordam\n\n"
+        "1) 📄 Yangi test orqali PDF yoki DOCX yuboring.\n"
+        "2) Bot savol bloklari va to‘g‘ri javoblarni aniqlaydi.\n"
+        "3) 30 / 40 / 50 / 100 savollik guruh hajmini tanlang.\n"
+        "4) Guruhni tanlang.\n"
+        "5) Har bir savol uchun vaqtni tanlang.\n"
+        "6) ▶️ START ni bosing.\n\n"
+        "Asosiy buyruqlar:\n"
+        "/start /new /quizzes /continue /progress /group /settings /help",
+        reply_markup=home_button(),
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_help(update.message)
+
+
+async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await send_help(query.message)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -337,28 +675,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "results": {},
         }
 
-        keyboard = [
-            [
-                InlineKeyboardButton("30", callback_data="size:30"),
-                InlineKeyboardButton("40", callback_data="size:40"),
-            ],
-            [
-                InlineKeyboardButton("50", callback_data="size:50"),
-                InlineKeyboardButton("100", callback_data="size:100"),
-            ],
-        ]
+
+        total_blocks = len(questions) + len(warnings)
 
         warning_text = ""
         if warnings:
-            warning_text = f"\n⚠️ {len(warnings)} ta savol to‘liq aniqlanmadi va o‘tkazib yuborildi."
+            preview = "\n".join(f"• {w}" for w in warnings[:8])
+            more = ""
+            if len(warnings) > 8:
+                more = f"\n• ... yana {len(warnings) - 8} ta"
+            warning_text = (
+                f"\n⚠️ Muammoli savollar: {len(warnings)}\n"
+                f"{preview}{more}"
+            )
 
         await status.edit_text(
             f"✅ Fayl tahlil qilindi.\n\n"
             f"📄 {filename}\n"
-            f"🧩 To‘liq aniqlangan savollar: {len(questions)}"
+            f"🧩 Savol bloklari topildi: {total_blocks}\n"
+            f"✅ Quizga tayyor: {len(questions)}"
             f"{warning_text}\n\n"
             f"Har bir guruhda nechta savol bo‘lsin?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=group_size_keyboard(),
         )
 
     except Exception as e:
@@ -414,6 +752,7 @@ async def show_groups(message, user_id: int):
         )
 
     rows.append([InlineKeyboardButton("📄 Boshqa fayl yuborish", callback_data="help_upload")])
+    rows.append([InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")])
 
     await message.reply_text(
         f"✅ {len(session['groups'])} ta guruh tayyor.\n\n"
@@ -466,6 +805,7 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("2 min", callback_data=f"timer:{group_index}:120"),
             ],
             [InlineKeyboardButton("📚 Guruhlar", callback_data="groups")],
+            [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
         ]
     )
 
@@ -844,6 +1184,13 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("new", new_command))
+    app.add_handler(CommandHandler("quizzes", quizzes_command))
+    app.add_handler(CommandHandler("continue", continue_command))
+    app.add_handler(CommandHandler("progress", progress_command))
+    app.add_handler(CommandHandler("group", group_mode_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(
         MessageHandler(
             filters.Document.PDF
@@ -852,6 +1199,14 @@ def main():
         )
     )
 
+    app.add_handler(CallbackQueryHandler(home_callback, pattern=r"^menu_home$"))
+    app.add_handler(CallbackQueryHandler(new_callback, pattern=r"^menu_new$"))
+    app.add_handler(CallbackQueryHandler(quizzes_callback, pattern=r"^menu_quizzes$"))
+    app.add_handler(CallbackQueryHandler(continue_callback, pattern=r"^menu_continue$"))
+    app.add_handler(CallbackQueryHandler(progress_callback, pattern=r"^menu_progress$"))
+    app.add_handler(CallbackQueryHandler(group_mode_callback, pattern=r"^menu_group$"))
+    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^menu_settings$"))
+    app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^menu_help$"))
     app.add_handler(CallbackQueryHandler(help_upload_callback, pattern=r"^help_upload$"))
     app.add_handler(CallbackQueryHandler(choose_size_callback, pattern=r"^size:\d+$"))
     app.add_handler(CallbackQueryHandler(group_callback, pattern=r"^group:\d+$"))
