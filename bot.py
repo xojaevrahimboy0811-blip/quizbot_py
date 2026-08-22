@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import asyncio
 from io import BytesIO
 from math import ceil
 from typing import List, Dict, Optional, Tuple
@@ -31,6 +32,17 @@ USER_DATA: Dict[int, dict] = {}
 POLL_MAP: Dict[str, dict] = {}
 
 GROUP_SIZES = [30, 40, 50, 100]
+
+# Telegram supports timed polls. These are the study choices shown before Start.
+TIMER_CHOICES = [10, 15, 20, 30, 40, 60, 120]
+
+
+def format_duration(seconds: int) -> str:
+    if seconds == 60:
+        return "1 daqiqa"
+    if seconds == 120:
+        return "2 daqiqa"
+    return f"{seconds} soniya"
 
 
 # -----------------------------
@@ -438,7 +450,21 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("▶️ Start", callback_data=f"startgroup:{group_index}")],
+            [
+                InlineKeyboardButton("10 sec", callback_data=f"timer:{group_index}:10"),
+                InlineKeyboardButton("15 sec", callback_data=f"timer:{group_index}:15"),
+            ],
+            [
+                InlineKeyboardButton("20 sec", callback_data=f"timer:{group_index}:20"),
+                InlineKeyboardButton("30 sec", callback_data=f"timer:{group_index}:30"),
+            ],
+            [
+                InlineKeyboardButton("40 sec", callback_data=f"timer:{group_index}:40"),
+                InlineKeyboardButton("60 sec", callback_data=f"timer:{group_index}:60"),
+            ],
+            [
+                InlineKeyboardButton("2 min", callback_data=f"timer:{group_index}:120"),
+            ],
             [InlineKeyboardButton("📚 Guruhlar", callback_data="groups")],
         ]
     )
@@ -448,7 +474,66 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Savollar: {start_no}-{end_no}\n"
         f"Jami: {len(group)}"
         f"{previous_text}\n\n"
-        f"Quiz hali boshlanmadi.",
+        "⏱ Har bir savol uchun vaqtni tanlang:",
+        reply_markup=keyboard,
+    )
+
+
+async def timer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    session = USER_DATA.get(user_id)
+    if not session:
+        await query.message.reply_text("❌ Sessiya topilmadi.")
+        return
+
+    _, group_text, seconds_text = query.data.split(":")
+    group_index = int(group_text)
+    seconds = int(seconds_text)
+
+    if group_index < 0 or group_index >= len(session["groups"]):
+        return
+    if seconds not in TIMER_CHOICES:
+        return
+
+    group = session["groups"][group_index]
+    session["selected_timer"] = seconds
+
+    # Maximum duration if the user uses all available time on every question.
+    max_seconds = len(group) * seconds
+    if max_seconds >= 60:
+        max_minutes = max_seconds / 60
+        max_time_text = f"{max_minutes:.1f} daqiqagacha"
+    else:
+        max_time_text = f"{max_seconds} soniyagacha"
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "▶️ START",
+                    callback_data=f"startgroup:{group_index}:{seconds}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏱ Vaqtni o‘zgartirish",
+                    callback_data=f"group:{group_index}",
+                )
+            ],
+            [InlineKeyboardButton("📚 Guruhlar", callback_data="groups")],
+        ]
+    )
+
+    await query.message.reply_text(
+        f"✅ Quiz tayyor.\n\n"
+        f"📘 Guruh: {group_index + 1}\n"
+        f"❓ Savollar: {len(group)}\n"
+        f"⏱ Har bir savol: {format_duration(seconds)}\n"
+        f"⌛ Maksimal vaqt: {max_time_text}\n\n"
+        "Quiz hali boshlanmadi. Boshlash uchun ▶️ START ni bosing.",
         reply_markup=keyboard,
     )
 
@@ -471,22 +556,39 @@ async def start_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("❌ Sessiya topilmadi.")
         return
 
-    group_index = int(query.data.split(":")[1])
-    if group_index < 0 or group_index >= len(session["groups"]):
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await query.message.reply_text("❌ Vaqt tanlanmagan. Guruhni qayta tanlang.")
         return
 
+    group_index = int(parts[1])
+    timer_seconds = int(parts[2])
+
+    if group_index < 0 or group_index >= len(session["groups"]):
+        return
+    if timer_seconds not in TIMER_CHOICES:
+        return
+
+    # A run_id prevents an old timeout task from affecting a restarted quiz.
+    session["run_counter"] = session.get("run_counter", 0) + 1
+    run_id = session["run_counter"]
+
     session["active"] = {
+        "run_id": run_id,
         "group_index": group_index,
         "questions": session["groups"][group_index],
         "current": 0,
         "correct": 0,
         "wrong": [],
+        "unanswered": [],
         "answered_polls": set(),
+        "timer_seconds": timer_seconds,
     }
 
     await query.message.reply_text(
         f"🚀 {group_index + 1}-guruh boshlandi!\n"
-        f"Jami {len(session['active']['questions'])} ta savol."
+        f"Jami {len(session['active']['questions'])} ta savol.\n"
+        f"⏱ Har bir savol uchun: {format_duration(timer_seconds)}"
     )
     await send_next_question(chat_id, user_id, context)
 
@@ -517,6 +619,7 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
 
     item = questions[idx]
     options = [telegram_safe_option(x) for x in item["options"]]
+    timer_seconds = active["timer_seconds"]
 
     try:
         msg = await context.bot.send_poll(
@@ -529,6 +632,7 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
             correct_option_id=int(item["correct_index"]),
             is_anonymous=False,
             allows_multiple_answers=False,
+            open_period=timer_seconds,
         )
     except Exception:
         logging.exception("Could not send poll")
@@ -546,7 +650,72 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         "chat_id": chat_id,
         "group_index": active["group_index"],
         "question_index": idx,
+        "run_id": active["run_id"],
+        "handled": False,
     }
+
+    # PollAnswerHandler is not called when the user gives no answer.
+    # This task moves the quiz forward once the poll's timer expires.
+    asyncio.create_task(
+        question_timeout(
+            poll_id=msg.poll.id,
+            user_id=user_id,
+            chat_id=chat_id,
+            group_index=active["group_index"],
+            question_index=idx,
+            run_id=active["run_id"],
+            timer_seconds=timer_seconds,
+            context=context,
+        )
+    )
+
+
+async def question_timeout(
+    poll_id: str,
+    user_id: int,
+    chat_id: int,
+    group_index: int,
+    question_index: int,
+    run_id: int,
+    timer_seconds: int,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    # Small buffer lets Telegram close the poll first.
+    await asyncio.sleep(timer_seconds + 0.8)
+
+    meta = POLL_MAP.get(poll_id)
+    if not meta or meta.get("handled"):
+        return
+
+    session = USER_DATA.get(user_id)
+    if not session or not session.get("active"):
+        POLL_MAP.pop(poll_id, None)
+        return
+
+    active = session["active"]
+
+    # Ignore timeout tasks from an older/restarted quiz.
+    if (
+        active.get("run_id") != run_id
+        or active.get("group_index") != group_index
+        or active.get("current") != question_index
+    ):
+        POLL_MAP.pop(poll_id, None)
+        return
+
+    # Mark this poll before awaiting anything else, preventing a late answer
+    # from advancing the quiz twice.
+    meta["handled"] = True
+    active["unanswered"].append(question_index)
+    active["current"] += 1
+    POLL_MAP.pop(poll_id, None)
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"⏱ Vaqt tugadi. {question_index + 1}-savol javobsiz qoldi.",
+    )
+
+    await send_next_question(chat_id, user_id, context)
 
 
 async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -559,6 +728,10 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if answer.user.id != meta["user_id"]:
         return
 
+    # If timeout already handled this poll, ignore any late update.
+    if meta.get("handled"):
+        return
+
     user_id = meta["user_id"]
     session = USER_DATA.get(user_id)
     if not session or not session.get("active"):
@@ -566,18 +739,25 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     active = session["active"]
 
-    # Ignore stale answers from an older quiz/group.
-    if active["group_index"] != meta["group_index"]:
+    # Ignore stale answers from an older/restarted quiz.
+    if (
+        active.get("run_id") != meta.get("run_id")
+        or active["group_index"] != meta["group_index"]
+    ):
+        POLL_MAP.pop(answer.poll_id, None)
         return
-
-    # Prevent the same poll from being counted twice.
-    if answer.poll_id in active["answered_polls"]:
-        return
-    active["answered_polls"].add(answer.poll_id)
 
     q_idx = meta["question_index"]
     if q_idx != active["current"]:
         return
+
+    if answer.poll_id in active["answered_polls"]:
+        return
+
+    # Mark handled BEFORE awaiting the next question. This prevents the timer
+    # task from advancing the quiz at the same time.
+    meta["handled"] = True
+    active["answered_polls"].add(answer.poll_id)
 
     item = active["questions"][q_idx]
     selected = answer.option_ids[0] if answer.option_ids else None
@@ -599,26 +779,46 @@ async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
 
     total = len(active["questions"])
     correct = active["correct"]
-    wrong = total - correct
+    wrong_answered = len(active["wrong"])
+    unanswered = len(active["unanswered"])
     percent = round((correct / total) * 100) if total else 0
     group_index = active["group_index"]
+    timer_seconds = active["timer_seconds"]
 
     session["results"][group_index] = {
         "correct": correct,
-        "wrong": wrong,
+        "wrong": wrong_answered,
+        "unanswered": unanswered,
         "total": total,
         "percent": percent,
+        "timer_seconds": timer_seconds,
     }
 
     buttons = [
-        [InlineKeyboardButton("🔄 Qayta ishlash", callback_data=f"startgroup:{group_index}")],
+        [
+            InlineKeyboardButton(
+                "🔄 Qayta ishlash",
+                callback_data=f"startgroup:{group_index}:{timer_seconds}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⏱ Boshqa vaqt bilan",
+                callback_data=f"group:{group_index}",
+            )
+        ],
         [InlineKeyboardButton("📚 Guruhlar", callback_data="groups")],
     ]
 
     if group_index + 1 < len(session["groups"]):
         buttons.insert(
             0,
-            [InlineKeyboardButton("➡️ Keyingi guruh", callback_data=f"group:{group_index + 1}")],
+            [
+                InlineKeyboardButton(
+                    "➡️ Keyingi guruh",
+                    callback_data=f"group:{group_index + 1}",
+                )
+            ],
         )
 
     session["active"] = None
@@ -628,8 +828,10 @@ async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
         text=(
             f"🏁 {group_index + 1}-guruh tugadi!\n\n"
             f"✅ To‘g‘ri: {correct}\n"
-            f"❌ Noto‘g‘ri: {wrong}\n"
-            f"🎯 Natija: {percent}%"
+            f"❌ Noto‘g‘ri: {wrong_answered}\n"
+            f"⏱ Javobsiz: {unanswered}\n"
+            f"🎯 Natija: {percent}%\n"
+            f"⏲ Vaqt: {format_duration(timer_seconds)}/savol"
         ),
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -653,8 +855,9 @@ def main():
     app.add_handler(CallbackQueryHandler(help_upload_callback, pattern=r"^help_upload$"))
     app.add_handler(CallbackQueryHandler(choose_size_callback, pattern=r"^size:\d+$"))
     app.add_handler(CallbackQueryHandler(group_callback, pattern=r"^group:\d+$"))
+    app.add_handler(CallbackQueryHandler(timer_callback, pattern=r"^timer:\d+:(?:10|15|20|30|40|60|120)$"))
     app.add_handler(CallbackQueryHandler(groups_callback, pattern=r"^groups$"))
-    app.add_handler(CallbackQueryHandler(start_group_callback, pattern=r"^startgroup:\d+$"))
+    app.add_handler(CallbackQueryHandler(start_group_callback, pattern=r"^startgroup:\d+:(?:10|15|20|30|40|60|120)$"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
     logging.info("Exam Quiz prototype started.")
