@@ -16,6 +16,7 @@ from docx import Document
 from pypdf import PdfReader
 
 import database_quiz as db
+import ai_parser
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -82,6 +83,7 @@ TIMER_CHOICES = [10, 15, 20, 30, 40, 60, 120]
 GROUP_EMPTY_STOP_THRESHOLD = 3
 GROUP_SETUP_TTL_SECONDS = 15 * 60
 FREE_IMPORT_LIMIT = 1
+PRO_AI_IMPORT_LIMIT = int(os.environ.get("PRO_AI_IMPORT_LIMIT", "20"))
 QUESTION_TRANSITION_DELAY = 1.0
 
 OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or 0)
@@ -1473,14 +1475,22 @@ async def group_parser_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
     if is_owner(user.id):
         await update.message.reply_text(
-            "🛠 Owner/Test rejimi\nYangi test importlari cheklanmagan."
+            "🛠 OWNER / PRO TEST REJIMI\n\n"
+            "✅ Yangi test importlari cheklanmagan\n"
+            "🤖 AI parser sinovi ochiq\n"
+            "📄 Oddiy parser har doim birinchi ishlaydi"
         )
         return
+
     if not db.is_enabled():
-        await update.message.reply_text("⚠️ Database ulanmagan, tarif holatini aniqlab bo‘lmaydi.")
+        await update.message.reply_text(
+            "⚠️ Database ulanmagan, tarif holatini aniqlab bo‘lmaydi."
+        )
         return
+
     try:
         await db.ensure_user(user.id, user.username, user.full_name)
         status = await db.get_plan_status(user.id, free_limit=FREE_IMPORT_LIMIT)
@@ -1488,16 +1498,96 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("Could not load plan")
         await update.message.reply_text("❌ Tarif holatini yuklab bo‘lmadi.")
         return
+
     if status.get("is_pro"):
-        text = "⭐ PRO\nCheksiz yangi test importlari."
+        try:
+            usage = await db.get_ai_usage(user.id)
+        except Exception:
+            usage = {"imports_used": 0, "recovered_questions": 0}
+
+        text = (
+            "👑 PRO\n\n"
+            "✅ Oddiy PDF/DOCX importlari: cheklanmagan\n"
+            "🤖 Noodatiy formatlar uchun AI parser: yoqilgan\n"
+            f"🤖 Bu oy AI importlari: {usage['imports_used']}/{PRO_AI_IMPORT_LIMIT}\n"
+            f"🧩 AI tiklagan savollar: {usage['recovered_questions']}\n\n"
+            "AI faqat oddiy parser yetarli bo‘lmaganda ishlaydi."
+        )
     else:
         text = (
-            "🆓 FREE\n"
+            "🎁 BEPUL\n\n"
             f"Bu oy yangi import: {status['imports_used']}/{FREE_IMPORT_LIMIT}\n"
             f"Qolgan: {status['imports_remaining']}\n\n"
-            "Saqlangan testlarni ishlash cheklanmagan."
+            "✅ Saqlangan testlarni ishlash cheklanmagan.\n"
+            "🤖 Noodatiy formatlarni avtomatik AI orqali tiklash — PRO funksiyasi."
         )
+
     await update.message.reply_text(text)
+
+
+async def grantpro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ Bu buyruq faqat bot egasi uchun.")
+        return
+
+    if not db.is_enabled():
+        await update.message.reply_text("❌ Database ulanmagan.")
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "Foydalanish:\n/grantpro TELEGRAM_ID KUN\n\n"
+            "Misol: /grantpro 123456789 30"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+        days = int(context.args[1]) if len(context.args) > 1 else 30
+        if days < 1 or days > 3650:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Telegram ID yoki kun noto‘g‘ri.")
+        return
+
+    try:
+        await db.grant_pro(target_id, days)
+    except Exception:
+        logging.exception("grantpro failed")
+        await update.message.reply_text("❌ PRO faollashtirib bo‘lmadi.")
+        return
+
+    await update.message.reply_text(
+        f"✅ {target_id} uchun PRO {days} kunga faollashtirildi."
+    )
+
+
+async def revokepro_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ Bu buyruq faqat bot egasi uchun.")
+        return
+
+    if not db.is_enabled():
+        await update.message.reply_text("❌ Database ulanmagan.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Foydalanish:\n/revokepro TELEGRAM_ID"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+        await db.revoke_pro(target_id)
+    except Exception:
+        logging.exception("revokepro failed")
+        await update.message.reply_text("❌ PRO bekor qilinmadi.")
+        return
+
+    await update.message.reply_text(
+        f"✅ {target_id} foydalanuvchi BEPUL tarifga qaytarildi."
+    )
 
 
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1550,6 +1640,157 @@ async def group_release_callback(update: Update, context: ContextTypes.DEFAULT_T
     GROUP_DATA.pop(chat_id, None)
     await clear_host_command_menu(context.bot, chat_id, old_host_id)
     await query.message.reply_text("🔓 Guruh quiz boshqaruvi bo‘shatildi. Endi boshqa foydalanuvchi boshlashi mumkin.")
+
+
+def _warning_number(warning: str) -> Optional[int]:
+    match = re.search(r"Question\s+(\d+)\s*:", warning or "", re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _remove_recovered_warnings(warnings: List[str], recovered: List[dict]) -> List[str]:
+    recovered_numbers = {
+        int(q["number"])
+        for q in recovered
+        if q.get("number") is not None
+    }
+    if not recovered_numbers:
+        return list(warnings)
+
+    result = []
+    for warning in warnings:
+        number = _warning_number(warning)
+        if number is not None and number in recovered_numbers:
+            continue
+        result.append(warning)
+    return result
+
+
+async def _pro_ai_access(user_id: int) -> Tuple[bool, str]:
+    if is_owner(user_id):
+        return True, "owner"
+
+    if not db.is_enabled():
+        return False, "database"
+
+    try:
+        status = await db.get_plan_status(user_id, free_limit=FREE_IMPORT_LIMIT)
+    except Exception:
+        logging.exception("Could not read Pro status for AI")
+        return False, "database"
+
+    if not status.get("is_pro"):
+        return False, "free"
+
+    if not ai_parser.is_configured():
+        return False, "not_configured"
+
+    try:
+        allowed, usage = await db.can_use_ai_import(
+            user_id,
+            monthly_limit=PRO_AI_IMPORT_LIMIT,
+        )
+    except Exception:
+        logging.exception("Could not read AI usage")
+        return False, "database"
+
+    if not allowed:
+        return False, "ai_limit"
+
+    return True, "pro"
+
+
+async def _run_ai_recovery(
+    *,
+    user_id: int,
+    text: str,
+    questions: List[dict],
+    warnings: List[str],
+    status_message,
+) -> Tuple[List[dict], List[str], str]:
+    """
+    Return (merged_questions, remaining_warnings, note).
+    AI failure never destroys deterministic-parser results.
+    """
+    allowed, reason = await _pro_ai_access(user_id)
+
+    if not allowed:
+        if reason == "free":
+            return questions, warnings, ""
+        if reason == "ai_limit":
+            return (
+                questions,
+                warnings,
+                f"\n⚠️ PRO AI limiti: bu oy {PRO_AI_IMPORT_LIMIT} ta AI import ishlatildi.",
+            )
+        if reason == "not_configured":
+            return (
+                questions,
+                warnings,
+                "\n⚠️ AI parser serverda sozlanmagan.",
+            )
+        return questions, warnings, ""
+
+    # Owner can test AI even if database plan fields are not set.
+    if not ai_parser.is_configured():
+        return questions, warnings, "\n⚠️ GEMINI_API_KEY topilmadi."
+
+    await status_message.edit_text(
+        "🤖 Oddiy parser yetarli bo‘lmadi.\n"
+        "PRO AI parser muammoli tuzilmani tekshirmoqda..."
+    )
+
+    try:
+        result = await ai_parser.recover_questions(
+            text=text,
+            existing_questions=questions,
+            parser_warnings=warnings,
+        )
+    except ai_parser.AIParserError as exc:
+        code = str(exc)
+        if code == "AI_QUOTA":
+            note = "\n⚠️ Gemini bepul kvotasi hozircha tugagan yoki cheklangan."
+        elif code == "AI_NOT_CONFIGURED":
+            note = "\n⚠️ GEMINI_API_KEY sozlanmagan."
+        elif code == "AI_MODEL_NOT_FOUND":
+            note = "\n⚠️ Mos Gemini modeli topilmadi."
+        else:
+            note = "\n⚠️ AI parser hozir ishlamadi. Oddiy parser natijasi saqlandi."
+        logging.warning("AI recovery failed: %s", code)
+        return questions, warnings, note
+    except Exception:
+        logging.exception("Unexpected AI recovery failure")
+        return (
+            questions,
+            warnings,
+            "\n⚠️ AI parserda texnik xato bo‘ldi. Oddiy parser natijasi saqlandi.",
+        )
+
+    recovered = result.get("questions") or []
+    merged = ai_parser.merge_questions(questions, recovered)
+    remaining = _remove_recovered_warnings(warnings, recovered)
+
+    # Preserve explicit AI unresolved findings.
+    for warning in result.get("warnings") or []:
+        if warning not in remaining:
+            remaining.append(warning)
+
+    if result.get("ai_called") and db.is_enabled() and not is_owner(user_id):
+        try:
+            await db.record_ai_import(user_id, len(recovered))
+        except Exception:
+            logging.exception("Could not record AI usage")
+
+    if recovered:
+        note = (
+            f"\n🤖 AI parser: {len(recovered)} ta qo‘shimcha savol tiklandi."
+        )
+    else:
+        note = (
+            "\n🤖 AI parser ishladi, lekin manbada aniq javobi "
+            "tasdiqlangan qo‘shimcha savol topilmadi."
+        )
+
+    return merged, remaining, note
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1619,15 +1860,36 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status.edit_text("🔎 Test savollari aniqlanmoqda...")
         questions, warnings = parse_questions(text)
+
+        ai_note = ""
+        # PRO AI fallback runs automatically only when the deterministic parser
+        # is incomplete (problem blocks) or found no ready questions.
+        if warnings or not questions:
+            questions, warnings, ai_note = await _run_ai_recovery(
+                user_id=user_id,
+                text=text,
+                questions=questions,
+                warnings=warnings,
+                status_message=status,
+            )
+
         total_blocks = len(questions) + len(warnings)
 
         if not questions:
+            ai_access, ai_reason = await _pro_ai_access(user_id)
+            pro_hint = ""
+            if ai_reason == "free":
+                pro_hint = (
+                    "\n\n👑 PRO foydalanuvchilarda noodatiy matnli PDF/DOCX "
+                    "formatlar avtomatik AI parser orqali tekshiriladi."
+                )
+
             await status.edit_text(
                 "❌ Quizga tayyor savol topilmadi.\n\n"
-                "Qo‘llab-quvvatlanadigan asosiy formatlar:\n\n"
+                "Qo‘llab-quvvatlanadigan asosiy format:\n\n"
                 "1. Savol\nA) ...\nB) ...\nC) ...\nD) ...\nJavob: B\n\n"
-                "yoki:\n1. Savol\nA) ...\n+B) to‘g‘ri javob\nC) ...\nD) ...\n\n"
                 "Bot to‘g‘ri javobni taxmin qilmaydi."
+                f"{ai_note}{pro_hint}"
             )
             return
 
@@ -1702,6 +1964,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Quizga tayyor: {len(questions)}"
             f"{warning_text}"
             f"{mode_note}"
+            f"{ai_note}"
             f"{saved_note}\n\n"
             "Har bir bo‘limda nechta savol bo‘lsin?",
             reply_markup=group_size_keyboard(group_mode=group_mode),
@@ -3643,6 +3906,8 @@ def build_telegram_application() -> Application:
     app.add_handler(CommandHandler("parser", parser_command))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("grantpro", grantpro_command))
+    app.add_handler(CommandHandler("revokepro", revokepro_command))
     app.add_handler(
         MessageHandler(
             filters.Document.PDF
