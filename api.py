@@ -1,13 +1,7 @@
-from fastapi import FastAPI
+"""
+Render entry point for Test Tuzuvchi.
 
-app = FastAPI(title="Exam Quiz Bot Health API")
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "exam-quiz-bot"}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+The Telegram webhook and health endpoint run in the SAME FastAPI process.
+There is no Telegram getUpdates/long-polling background process.
+"""
+from bot import web_app as app
