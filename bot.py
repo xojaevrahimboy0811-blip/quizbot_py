@@ -7,6 +7,10 @@ import time
 from io import BytesIO
 from math import ceil
 from typing import List, Dict, Optional, Tuple
+from contextlib import asynccontextmanager
+import hashlib
+
+from fastapi import FastAPI, Request, HTTPException
 
 from docx import Document
 from pypdf import PdfReader
@@ -38,6 +42,31 @@ logging.basicConfig(
 )
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+
+# Telegram webhook configuration.
+# No long-polling/getUpdates process is used in this version.
+RENDER_EXTERNAL_URL = (os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+RENDER_EXTERNAL_HOSTNAME = (os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip()
+WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or "").strip().rstrip("/")
+
+if not WEBHOOK_BASE_URL:
+    if RENDER_EXTERNAL_URL:
+        WEBHOOK_BASE_URL = RENDER_EXTERNAL_URL
+    elif RENDER_EXTERNAL_HOSTNAME:
+        WEBHOOK_BASE_URL = f"https://{RENDER_EXTERNAL_HOSTNAME}"
+    else:
+        WEBHOOK_BASE_URL = "https://quizbot-py-1.onrender.com"
+
+WEBHOOK_PATH = "/telegram"
+WEBHOOK_URL = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+
+# Telegram signs webhook requests with this secret header.
+# It rotates automatically if TELEGRAM_TOKEN changes.
+WEBHOOK_SECRET = hashlib.sha256(
+    (TELEGRAM_TOKEN or "missing-token").encode("utf-8")
+).hexdigest()[:48]
+
+TELEGRAM_APP: Optional[Application] = None
 
 # Fast prototype storage.
 # NOTE: This is kept in RAM, so a Render restart clears current sessions.
@@ -593,15 +622,13 @@ def group_home_keyboard() -> InlineKeyboardMarkup:
 def order_settings_keyboard(session: dict, group_mode: bool) -> InlineKeyboardMarkup:
     q_on = bool(session.get("shuffle_questions"))
     a_on = bool(session.get("shuffle_options"))
-    mode = session.get("quiz_mode", "practice")
     if group_mode:
-        q_cb, a_cb, mode_cb, done_cb, back_cb = "gtoq", "gtoa", "gtomode", "gorderdone", "g_home"
+        q_cb, a_cb, done_cb, back_cb = "gtoq", "gtoa", "gorderdone", "g_home"
     else:
-        q_cb, a_cb, mode_cb, done_cb, back_cb = "ptoq", "ptoa", "ptomode", "porderdone", "menu_home"
+        q_cb, a_cb, done_cb, back_cb = "ptoq", "ptoa", "porderdone", "menu_home"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{'✅' if q_on else '⬜'} Savollarni aralashtirish", callback_data=q_cb)],
         [InlineKeyboardButton(f"{'✅' if a_on else '⬜'} Variantlarni aralashtirish", callback_data=a_cb)],
-        [InlineKeyboardButton("📖 Mashq rejimi" if mode == "practice" else "📝 Imtihon rejimi", callback_data=mode_cb)],
         [InlineKeyboardButton("➡️ Davom etish", callback_data=done_cb)],
         [InlineKeyboardButton("← Orqaga", callback_data=back_cb)],
     ])
@@ -613,8 +640,7 @@ async def send_order_settings(message, session: dict, group_mode: bool):
         "Savollarni aralashtirish — savollar boshqa tartibda beriladi.\n"
         "Variantlarni aralashtirish — A/B/C/D joylashuvi har savolda o‘zgaradi, "
         "lekin to‘g‘ri javob avtomatik moslashtiriladi.\n\n"
-        "📖 Mashq rejimi — javobdan keyin to‘g‘ri/noto‘g‘ri holat darhol ko‘rinadi.\n"
-        "📝 Imtihon rejimi — to‘g‘ri javob savol paytida ko‘rsatilmaydi; natija oxirida chiqadi.",
+        "Test rejimi START dan oldin alohida tanlanadi.",
         reply_markup=order_settings_keyboard(session, group_mode),
     )
 
@@ -952,7 +978,7 @@ async def private_load_saved_callback(update: Update, context: ContextTypes.DEFA
         "owner_full_name": update.effective_user.full_name,
         "shuffle_questions": bool(prefs.get("shuffle_questions")),
         "shuffle_options": bool(prefs.get("shuffle_options")),
-        "quiz_mode": prefs.get("quiz_mode", "practice"),
+        "quiz_mode": None,
         "parser_total_blocks": len(quiz["questions"]),
     }
 
@@ -1003,7 +1029,7 @@ async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAUL
         "saved_quiz_id": quiz_id,
         "shuffle_questions": bool(prefs.get("shuffle_questions")),
         "shuffle_options": bool(prefs.get("shuffle_options")),
-        "quiz_mode": prefs.get("quiz_mode", "practice"),
+        "quiz_mode": None,
         "parser_total_blocks": len(quiz["questions"]),
     }
 
@@ -1275,7 +1301,7 @@ async def send_settings(message, user_id: int):
         "Bo‘lim hajmi va taymer esa har safar alohida tanlanadi.\n\n"
         f"🔀 Savollar: {'yoqilgan' if prefs['shuffle_questions'] else 'o‘chirilgan'}\n"
         f"🔀 Variantlar: {'yoqilgan' if prefs['shuffle_options'] else 'o‘chirilgan'}\n"
-        f"🎮 Rejim: {'Imtihon' if prefs['quiz_mode'] == 'exam' else 'Mashq'}",
+        "🎮 Rejim: har bir test boshlanishidan oldin tanlanadi.",
         reply_markup=await settings_keyboard(user_id),
     )
 
@@ -1623,7 +1649,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "last_leaderboard_text": None,
             "shuffle_questions": bool(prefs.get("shuffle_questions")),
             "shuffle_options": bool(prefs.get("shuffle_options")),
-            "quiz_mode": prefs.get("quiz_mode", "practice"),
+            "quiz_mode": None,
             "parser_total_blocks": total_blocks,
         }
 
@@ -1877,43 +1903,105 @@ async def timer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if seconds not in TIMER_CHOICES:
         return
 
-    group = session["groups"][group_index]
     session["selected_timer"] = seconds
+    session["quiz_mode"] = None
+    session["pending_start"] = {
+        "group_index": group_index,
+        "timer_seconds": seconds,
+        "mode": None,
+    }
 
-    # Maximum duration if the user uses all available time on every question.
-    max_seconds = len(group) * seconds
-    if max_seconds >= 60:
-        max_minutes = max_seconds / 60
-        max_time_text = f"{max_minutes:.1f} daqiqagacha"
-    else:
-        max_time_text = f"{max_seconds} soniyagacha"
-
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
+    await query.message.reply_text(
+        "🎮 TEST REJIMINI TANLANG\n\n"
+        "📖 Mashq rejimi\n"
+        "• Har savoldan keyin Telegram to‘g‘ri/noto‘g‘ri javobni ko‘rsatadi.\n"
+        "• Xatolarni keyin qayta mashq qilish mumkin.\n\n"
+        "📝 Imtihon rejimi\n"
+        "• Savol paytida to‘g‘ri javob ko‘rsatilmaydi.\n"
+        "• Natija test oxirida chiqadi.\n\n"
+        "Davom etish uchun bittasini tanlang:",
+        reply_markup=InlineKeyboardMarkup(
+            [[
                 InlineKeyboardButton(
-                    "▶️ START",
-                    callback_data=f"startgroup:{group_index}:{seconds}",
-                )
-            ],
-            [
+                    "📖 Mashq rejimi",
+                    callback_data=f"pmode:{group_index}:{seconds}:practice",
+                ),
+                InlineKeyboardButton(
+                    "📝 Imtihon rejimi",
+                    callback_data=f"pmode:{group_index}:{seconds}:exam",
+                ),
+            ],[
                 InlineKeyboardButton(
                     "⏱ Vaqtni o‘zgartirish",
                     callback_data=f"group:{group_index}",
                 )
-            ],
-            [InlineKeyboardButton("📚 Guruhlar", callback_data="groups")],
-        ]
+            ]]
+        ),
     )
 
+
+async def private_mode_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    session = USER_DATA.get(user_id)
+    if not session:
+        await query.message.reply_text("❌ Sessiya topilmadi.")
+        return
+
+    _, group_text, seconds_text, mode = query.data.split(":")
+    group_index = int(group_text)
+    seconds = int(seconds_text)
+
+    if mode not in ("practice", "exam"):
+        return
+    if seconds not in TIMER_CHOICES:
+        return
+    if group_index < 0 or group_index >= len(session.get("groups", [])):
+        return
+
+    session["quiz_mode"] = mode
+    session["pending_start"] = {
+        "group_index": group_index,
+        "timer_seconds": seconds,
+        "mode": mode,
+    }
+
+    group = session["groups"][group_index]
+    max_seconds = len(group) * seconds
+    max_time_text = (
+        f"{max_seconds / 60:.1f} daqiqagacha"
+        if max_seconds >= 60
+        else f"{max_seconds} soniyagacha"
+    )
+    mode_text = "📖 Mashq rejimi" if mode == "practice" else "📝 Imtihon rejimi"
+
     await query.message.reply_text(
-        f"✅ Quiz tayyor.\n\n"
+        f"✅ Test tayyor.\n\n"
         f"📘 Guruh: {group_index + 1}\n"
         f"❓ Savollar: {len(group)}\n"
         f"⏱ Har bir savol: {format_duration(seconds)}\n"
+        f"🎮 Rejim: {mode_text}\n"
         f"⌛ Maksimal vaqt: {max_time_text}\n\n"
-        "Quiz hali boshlanmadi. Boshlash uchun ▶️ START ni bosing.",
-        reply_markup=keyboard,
+        "Test hali boshlanmadi. Boshlash uchun ▶️ START ni bosing.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(
+                    "▶️ START",
+                    callback_data=f"startgroup:{group_index}:{seconds}",
+                )],
+                [InlineKeyboardButton(
+                    "🎮 Rejimni o‘zgartirish",
+                    callback_data=f"timer:{group_index}:{seconds}",
+                )],
+                [InlineKeyboardButton(
+                    "⏱ Vaqtni o‘zgartirish",
+                    callback_data=f"group:{group_index}",
+                )],
+                [InlineKeyboardButton("📚 Guruhlar", callback_data="groups")],
+            ]
+        ),
     )
 
 
@@ -1950,6 +2038,16 @@ async def start_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if timer_seconds not in TIMER_CHOICES:
         return
+
+    pending = session.get("pending_start") or {}
+    if (
+        pending.get("group_index") != group_index
+        or pending.get("timer_seconds") != timer_seconds
+        or pending.get("mode") not in ("practice", "exam")
+    ):
+        await query.message.reply_text("🎮 Avval Mashq yoki Imtihon rejimini tanlang.")
+        return
+    session["quiz_mode"] = pending["mode"]
 
     # A run_id prevents an old timeout task from affecting a restarted quiz.
     session["run_counter"] = session.get("run_counter", 0) + 1
@@ -2571,6 +2669,74 @@ async def group_timer_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     touch_group_host(session)
+    session["quiz_mode"] = None
+    session["pending_start"] = {
+        "group_index": group_index,
+        "timer_seconds": seconds,
+        "mode": None,
+    }
+
+    await query.message.reply_text(
+        "🎮 GURUH TESTI REJIMINI TANLANG\n\n"
+        "📖 Mashq rejimi\n"
+        "• To‘g‘ri/noto‘g‘ri javob savolning o‘zida ko‘rinadi.\n\n"
+        "📝 Imtihon rejimi\n"
+        "• To‘g‘ri javob savol vaqtida ko‘rsatilmaydi.\n"
+        "• Natijalar test oxirida hisoblanadi.\n\n"
+        "Rejimni faqat boshqaruvchi tanlaydi:",
+        reply_markup=InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(
+                    "📖 Mashq rejimi",
+                    callback_data=f"gmode:{group_index}:{seconds}:practice",
+                ),
+                InlineKeyboardButton(
+                    "📝 Imtihon rejimi",
+                    callback_data=f"gmode:{group_index}:{seconds}:exam",
+                ),
+            ],[
+                InlineKeyboardButton(
+                    "⏱ Vaqtni o‘zgartirish",
+                    callback_data=f"ggroup:{group_index}",
+                )
+            ]]
+        ),
+    )
+
+
+async def group_mode_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    session = GROUP_DATA.get(chat_id)
+
+    if not session:
+        await query.answer()
+        await query.message.reply_text("❌ Guruh sessiyasi topilmadi.")
+        return
+    if not group_controller_ok(update, session):
+        await query.answer("Rejimni faqat boshqaruvchi tanlaydi.", show_alert=True)
+        return
+    await query.answer()
+
+    _, group_text, seconds_text, mode = query.data.split(":")
+    group_index = int(group_text)
+    seconds = int(seconds_text)
+
+    if mode not in ("practice", "exam"):
+        return
+    if seconds not in TIMER_CHOICES:
+        return
+    if group_index < 0 or group_index >= len(session.get("groups", [])):
+        return
+
+    touch_group_host(session)
+    session["quiz_mode"] = mode
+    session["pending_start"] = {
+        "group_index": group_index,
+        "timer_seconds": seconds,
+        "mode": mode,
+    }
+
     group = session["groups"][group_index]
     max_seconds = len(group) * seconds
     max_time_text = (
@@ -2578,28 +2744,30 @@ async def group_timer_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if max_seconds >= 60
         else f"{max_seconds} soniyagacha"
     )
+    mode_text = "📖 Mashq rejimi" if mode == "practice" else "📝 Imtihon rejimi"
 
     await query.message.reply_text(
-        f"✅ Guruh quizi tayyor.\n\n"
+        f"✅ Guruh testi tayyor.\n\n"
         f"📘 Bo‘lim: {group_index + 1}\n"
         f"❓ Savollar: {len(group)}\n"
         f"⏱ Har bir savol: {format_duration(seconds)}\n"
+        f"🎮 Rejim: {mode_text}\n"
         f"⌛ Maksimal vaqt: {max_time_text}\n\n"
         "Hamma tayyor bo‘lganda ▶️ START ni bosing.",
         reply_markup=InlineKeyboardMarkup(
             [
-                [
-                    InlineKeyboardButton(
-                        "▶️ START",
-                        callback_data=f"gstart:{group_index}:{seconds}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "⏱ Vaqtni o‘zgartirish",
-                        callback_data=f"ggroup:{group_index}",
-                    )
-                ],
+                [InlineKeyboardButton(
+                    "▶️ START",
+                    callback_data=f"gstart:{group_index}:{seconds}",
+                )],
+                [InlineKeyboardButton(
+                    "🎮 Rejimni o‘zgartirish",
+                    callback_data=f"gtimer:{group_index}:{seconds}",
+                )],
+                [InlineKeyboardButton(
+                    "⏱ Vaqtni o‘zgartirish",
+                    callback_data=f"ggroup:{group_index}",
+                )],
                 [InlineKeyboardButton("📚 Bo‘limlar", callback_data="ggroups")],
             ]
         ),
@@ -2641,6 +2809,16 @@ async def group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if timer_seconds not in TIMER_CHOICES:
         return
+
+    pending = session.get("pending_start") or {}
+    if (
+        pending.get("group_index") != group_index
+        or pending.get("timer_seconds") != timer_seconds
+        or pending.get("mode") not in ("practice", "exam")
+    ):
+        await query.message.reply_text("🎮 Avval Mashq yoki Imtihon rejimini tanlang.")
+        return
+    session["quiz_mode"] = pending["mode"]
     if group_index < 0 or group_index >= len(session.get("groups", [])):
         return
 
@@ -3440,17 +3618,12 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         logging.exception("Xato xabarini yuborib bo‘lmadi")
 
 
-def main():
+def build_telegram_application() -> Application:
+    """Create the Telegram application without long polling."""
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN environment variable is missing.")
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(app_post_init)
-        .post_shutdown(app_post_shutdown)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new_command))
@@ -3514,27 +3687,141 @@ def main():
     app.add_handler(CallbackQueryHandler(choose_size_callback, pattern=r"^size:\d+$"))
     app.add_handler(CallbackQueryHandler(private_toggle_questions_callback, pattern=r"^ptoq$"))
     app.add_handler(CallbackQueryHandler(private_toggle_options_callback, pattern=r"^ptoa$"))
-    app.add_handler(CallbackQueryHandler(private_toggle_mode_callback, pattern=r"^ptomode$"))
     app.add_handler(CallbackQueryHandler(private_order_done_callback, pattern=r"^porderdone$"))
     app.add_handler(CallbackQueryHandler(group_choose_size_callback, pattern=r"^gsize:\d+$"))
     app.add_handler(CallbackQueryHandler(group_toggle_questions_callback, pattern=r"^gtoq$"))
     app.add_handler(CallbackQueryHandler(group_toggle_options_callback, pattern=r"^gtoa$"))
-    app.add_handler(CallbackQueryHandler(group_toggle_mode_callback, pattern=r"^gtomode$"))
     app.add_handler(CallbackQueryHandler(group_order_done_callback, pattern=r"^gorderdone$"))
     app.add_handler(CallbackQueryHandler(group_quiz_group_callback, pattern=r"^ggroup:\d+$"))
     app.add_handler(CallbackQueryHandler(group_groups_callback, pattern=r"^ggroups$"))
     app.add_handler(CallbackQueryHandler(group_timer_callback, pattern=r"^gtimer:\d+:(?:10|15|20|30|40|60|120)$"))
+    app.add_handler(CallbackQueryHandler(group_mode_choice_callback, pattern=r"^gmode:\d+:(?:10|15|20|30|40|60|120):(?:practice|exam)$"))
     app.add_handler(CallbackQueryHandler(group_start_callback, pattern=r"^gstart:\d+:(?:10|15|20|30|40|60|120)$"))
     app.add_handler(CallbackQueryHandler(retry_wrong_callback, pattern=r"^retrywrong:\d+:(?:10|15|20|30|40|60|120)$"))
     app.add_handler(CallbackQueryHandler(group_callback, pattern=r"^group:\d+$"))
     app.add_handler(CallbackQueryHandler(timer_callback, pattern=r"^timer:\d+:(?:10|15|20|30|40|60|120)$"))
+    app.add_handler(CallbackQueryHandler(private_mode_choice_callback, pattern=r"^pmode:\d+:(?:10|15|20|30|40|60|120):(?:practice|exam)$"))
     app.add_handler(CallbackQueryHandler(groups_callback, pattern=r"^groups$"))
     app.add_handler(CallbackQueryHandler(start_group_callback, pattern=r"^startgroup:\d+:(?:10|15|20|30|40|60|120)$"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
     app.add_error_handler(global_error_handler)
-    logging.info("Test Tuzuvchi ishga tushdi.")
-    app.run_polling(drop_pending_updates=True)
+    return app
+
+
+@asynccontextmanager
+async def webhook_lifespan(app: FastAPI):
+    """Run Telegram and the health API in one Render web process."""
+    global TELEGRAM_APP
+
+    telegram_app = build_telegram_application()
+    TELEGRAM_APP = telegram_app
+
+    try:
+        await telegram_app.initialize()
+
+        # In FastAPI integration, call our existing initialization hook directly.
+        await app_post_init(telegram_app)
+
+        # Starts python-telegram-bot's internal update processor only.
+        # It does NOT start getUpdates/long polling.
+        await telegram_app.start()
+
+        # Register/refresh the webhook. Once a webhook is active,
+        # Telegram does not allow getUpdates for this bot.
+        await telegram_app.bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+            secret_token=WEBHOOK_SECRET,
+        )
+
+        logging.info("Test Tuzuvchi webhook rejimida ishga tushdi: %s", WEBHOOK_URL)
+        yield
+
+    finally:
+        try:
+            if telegram_app.running:
+                await telegram_app.stop()
+        except Exception:
+            logging.exception("Telegram application stop failed")
+
+        try:
+            await app_post_shutdown(telegram_app)
+        except Exception:
+            logging.exception("Application shutdown hook failed")
+
+        try:
+            await telegram_app.shutdown()
+        except Exception:
+            logging.exception("Telegram application shutdown failed")
+
+        TELEGRAM_APP = None
+
+
+web_app = FastAPI(
+    title="Test Tuzuvchi",
+    version="1.0",
+    lifespan=webhook_lifespan,
+)
+
+
+@web_app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "test-tuzuvchi",
+        "telegram_mode": "webhook",
+    }
+
+
+@web_app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "telegram_mode": "webhook",
+        "telegram_app_running": bool(TELEGRAM_APP and TELEGRAM_APP.running),
+        "database_enabled": db.is_enabled(),
+    }
+
+
+@web_app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """Receive a Telegram update and queue it for the PTB application."""
+    if TELEGRAM_APP is None or not TELEGRAM_APP.running:
+        raise HTTPException(status_code=503, detail="Telegram application is starting")
+
+    supplied_secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
+    )
+    if supplied_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    try:
+        payload = await request.json()
+        update = Update.de_json(payload, TELEGRAM_APP.bot)
+    except Exception as exc:
+        logging.warning("Invalid Telegram webhook payload: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid Telegram update")
+
+    # Return to Telegram quickly; PTB processes the update from its queue.
+    await TELEGRAM_APP.update_queue.put(update)
+    return {"ok": True}
+
+
+def main():
+    """
+    Polling is intentionally disabled.
+
+    The existing Render command can stay:
+    python bot.py & uvicorn api:app --host 0.0.0.0 --port $PORT
+
+    `python bot.py` exits immediately; `api:app` is the only live service.
+    """
+    logging.info(
+        "Webhook versiya: polling ishga tushirilmaydi. "
+        "Uvicorn api:app webhook serverni boshqaradi."
+    )
 
 
 if __name__ == "__main__":
