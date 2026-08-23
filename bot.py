@@ -53,6 +53,7 @@ TIMER_CHOICES = [10, 15, 20, 30, 40, 60, 120]
 GROUP_EMPTY_STOP_THRESHOLD = 3
 GROUP_SETUP_TTL_SECONDS = 15 * 60
 FREE_IMPORT_LIMIT = 1
+QUESTION_TRANSITION_DELAY = 1.0
 
 OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or 0)
 
@@ -144,6 +145,19 @@ def format_duration(seconds: int) -> str:
 
 def is_owner(user_id: int) -> bool:
     return bool(OWNER_TELEGRAM_ID and user_id == OWNER_TELEGRAM_ID)
+
+
+async def effective_preferences(user_id: int) -> dict:
+    if db.is_enabled():
+        try:
+            return await db.get_user_preferences(user_id)
+        except Exception:
+            logging.exception("Sozlamalarni o‘qib bo‘lmadi")
+    return {"shuffle_questions": False, "shuffle_options": False, "quiz_mode": "practice"}
+
+
+def quiz_mode_label(mode: str) -> str:
+    return "📝 Imtihon" if mode == "exam" else "📖 Mashq"
 
 
 def prepare_poll_options(item: dict, shuffle_options: bool) -> Tuple[List[str], int]:
@@ -568,7 +582,7 @@ def group_home_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🏆 Oxirgi reyting", callback_data="g_leaderboard"),
             ],
             [
-                InlineKeyboardButton("🧪 Parser report", callback_data="g_parser"),
+                InlineKeyboardButton("🧪 Parser hisoboti", callback_data="g_parser"),
                 InlineKeyboardButton("🔓 Sessiyani tugatish", callback_data="g_release"),
             ],
             [InlineKeyboardButton("❓ Yordam", callback_data="g_help")],
@@ -579,28 +593,18 @@ def group_home_keyboard() -> InlineKeyboardMarkup:
 def order_settings_keyboard(session: dict, group_mode: bool) -> InlineKeyboardMarkup:
     q_on = bool(session.get("shuffle_questions"))
     a_on = bool(session.get("shuffle_options"))
+    mode = session.get("quiz_mode", "practice")
     if group_mode:
-        q_cb, a_cb, done_cb, back_cb = "gtoq", "gtoa", "gorderdone", "g_home"
+        q_cb, a_cb, mode_cb, done_cb, back_cb = "gtoq", "gtoa", "gtomode", "gorderdone", "g_home"
     else:
-        q_cb, a_cb, done_cb, back_cb = "ptoq", "ptoa", "porderdone", "menu_home"
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"{'✅' if q_on else '⬜'} Savollarni aralashtirish",
-                    callback_data=q_cb,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    f"{'✅' if a_on else '⬜'} Variantlarni aralashtirish",
-                    callback_data=a_cb,
-                )
-            ],
-            [InlineKeyboardButton("➡️ Davom etish", callback_data=done_cb)],
-            [InlineKeyboardButton("← Orqaga", callback_data=back_cb)],
-        ]
-    )
+        q_cb, a_cb, mode_cb, done_cb, back_cb = "ptoq", "ptoa", "ptomode", "porderdone", "menu_home"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'✅' if q_on else '⬜'} Savollarni aralashtirish", callback_data=q_cb)],
+        [InlineKeyboardButton(f"{'✅' if a_on else '⬜'} Variantlarni aralashtirish", callback_data=a_cb)],
+        [InlineKeyboardButton("📖 Mashq rejimi" if mode == "practice" else "📝 Imtihon rejimi", callback_data=mode_cb)],
+        [InlineKeyboardButton("➡️ Davom etish", callback_data=done_cb)],
+        [InlineKeyboardButton("← Orqaga", callback_data=back_cb)],
+    ])
 
 
 async def send_order_settings(message, session: dict, group_mode: bool):
@@ -608,14 +612,16 @@ async def send_order_settings(message, session: dict, group_mode: bool):
         "🔀 Quiz tartibini tanlang\n\n"
         "Savollarni aralashtirish — savollar boshqa tartibda beriladi.\n"
         "Variantlarni aralashtirish — A/B/C/D joylashuvi har savolda o‘zgaradi, "
-        "lekin to‘g‘ri javob avtomatik moslashtiriladi.",
+        "lekin to‘g‘ri javob avtomatik moslashtiriladi.\n\n"
+        "📖 Mashq rejimi — javobdan keyin to‘g‘ri/noto‘g‘ri holat darhol ko‘rinadi.\n"
+        "📝 Imtihon rejimi — to‘g‘ri javob savol paytida ko‘rsatilmaydi; natija oxirida chiqadi.",
         reply_markup=order_settings_keyboard(session, group_mode),
     )
 
 
 async def send_home(message):
     await message.reply_text(
-        "🎓 Exam Quiz Bot\n\n"
+        "🎓 Test Tuzuvchi\n\n"
         "Kerakli bo‘limni tanlang:",
         reply_markup=main_menu(),
     )
@@ -630,7 +636,7 @@ async def send_group_home(message):
         host_text = f"👤 Boshqaruvchi: {session.get('controller_name') or 'foydalanuvchi'}"
 
     await message.reply_text(
-        "👥 Exam Quiz Bot — guruh rejimi\n\n"
+        "👥 Test Tuzuvchi — guruh rejimi\n\n"
         f"{host_text}\n\n"
         "Quizni boshlash uchun /group yuboring yoki ‘Mening testlarim’/‘Test yuklash’ni bosing. "
         "Bir vaqtda faqat bitta foydalanuvchi quizni boshqaradi.\n\n"
@@ -675,7 +681,7 @@ async def send_new_quiz_prompt(message):
         "• +B) ... / *B) ... / ✓B) ...\n\n"
         "Savol raqamida nuqta yoki bo‘sh joy tushib qolsa ham bot imkon qadar savolni taniydi. "
         "Bot to‘g‘ri javobni taxmin qilmaydi.\n\n"
-        "🎁 Free: oyiga 1 ta yangi test import. Saqlangan testlarni cheksiz ishlash mumkin.",
+        "🎁 Bepul: oyiga 1 ta yangi test import. Saqlangan testlarni cheksiz ishlash mumkin.",
         reply_markup=home_button(),
     )
 
@@ -747,7 +753,7 @@ async def show_saved_quizzes(message, tg_user, group_mode: bool = False):
         return
 
     rows = []
-    prefix = "gload" if group_mode else "pload"
+    prefix = "gload" if group_mode else "pquiz"
     for quiz in quizzes:
         name = quiz["name"]
         if len(name) > 32:
@@ -808,6 +814,116 @@ async def group_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_saved_quizzes(query.message, update.effective_user, group_mode=True)
 
 
+async def private_quiz_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.split(":")[1])
+    quiz = await db.load_quiz(update.effective_user.id, quiz_id) if db.is_enabled() else None
+    if not quiz:
+        await query.message.reply_text("❌ Test topilmadi yoki sizga tegishli emas.")
+        return
+    await query.message.reply_text(
+        f"📘 {quiz['name']}\n\n❓ Savollar: {len(quiz['questions'])}\n📄 Manba: {quiz['source_filename']}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Boshlash", callback_data=f"pload:{quiz_id}")],
+            [InlineKeyboardButton("✏️ Nomini o‘zgartirish", callback_data=f"prename:{quiz_id}"),
+             InlineKeyboardButton("📊 Natijalar", callback_data=f"presults:{quiz_id}")],
+            [InlineKeyboardButton("🗑 O‘chirish", callback_data=f"pdelete:{quiz_id}")],
+            [InlineKeyboardButton("← Testlarim", callback_data="menu_quizzes")],
+        ]),
+    )
+
+
+async def private_rename_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["rename_quiz_id"] = int(query.data.split(":")[1])
+    await query.message.reply_text("✏️ Yangi nomni yozing. Bekor qilish uchun /cancel yuboring.")
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.pop("rename_quiz_id", None)
+    await update.message.reply_text("✅ Amal bekor qilindi." if pending else "ℹ️ Bekor qilinadigan amal yo‘q.")
+
+
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    quiz_id = context.user_data.get("rename_quiz_id")
+    if not quiz_id:
+        return
+    name = (update.message.text or "").strip()
+    if not name:
+        await update.message.reply_text("❌ Nom bo‘sh bo‘lishi mumkin emas.")
+        return
+    if len(name) > 120:
+        await update.message.reply_text("❌ Nom 120 belgidan qisqa bo‘lsin.")
+        return
+    ok = await db.rename_quiz(update.effective_user.id, int(quiz_id), name)
+    if ok:
+        context.user_data.pop("rename_quiz_id", None)
+        await update.message.reply_text(
+            f"✅ Test nomi o‘zgartirildi: {name}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📚 Testlarim", callback_data="menu_quizzes")]]),
+        )
+    else:
+        await update.message.reply_text("❌ Test nomini o‘zgartirib bo‘lmadi.")
+
+
+async def private_delete_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.split(":")[1])
+    quiz = await db.load_quiz(update.effective_user.id, quiz_id) if db.is_enabled() else None
+    if not quiz:
+        await query.message.reply_text("❌ Test topilmadi.")
+        return
+    await query.message.reply_text(
+        f"🗑 “{quiz['name']}” testini butunlay o‘chirasizmi?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Ha, o‘chirish", callback_data=f"pdeleteyes:{quiz_id}")],
+            [InlineKeyboardButton("← Bekor qilish", callback_data=f"pquiz:{quiz_id}")],
+        ]),
+    )
+
+
+async def private_delete_quiz_yes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.split(":")[1])
+    ok = await db.delete_quiz(update.effective_user.id, quiz_id)
+    if ok:
+        session = USER_DATA.get(update.effective_user.id)
+        if session and session.get("saved_quiz_id") == quiz_id:
+            USER_DATA.pop(update.effective_user.id, None)
+        await query.message.reply_text("✅ Test o‘chirildi.", reply_markup=home_button())
+    else:
+        await query.message.reply_text("❌ Testni o‘chirib bo‘lmadi.")
+
+
+async def private_quiz_results_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    quiz_id = int(query.data.split(":")[1])
+    quiz = await db.load_quiz(update.effective_user.id, quiz_id) if db.is_enabled() else None
+    if not quiz:
+        await query.message.reply_text("❌ Test topilmadi.")
+        return
+    attempts = await db.list_quiz_attempts(update.effective_user.id, quiz_id, 10)
+    lines = [f"📊 {quiz['name']}"]
+    if not attempts:
+        lines += ["", "Hozircha natija yo‘q."]
+    else:
+        lines += ["", "Oxirgi natijalar:"]
+        for row in attempts:
+            mode = {"group": "👥 Guruh", "review": "🧠 Xatolar"}.get(row.get("mode"), "📘 Shaxsiy")
+            sec = row.get("section_index")
+            sec_text = f" · {sec + 1}-bo‘lim" if sec is not None else ""
+            lines.append(f"{mode}{sec_text}: {row['correct']}/{row['total']} ({row['percent']}%) · 🔥 {row['best_streak']}")
+    await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")],
+        [InlineKeyboardButton("📚 Testlarim", callback_data="menu_quizzes")],
+    ]))
+
+
 async def private_load_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -821,6 +937,7 @@ async def private_load_saved_callback(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text("❌ Test topilmadi yoki sizga tegishli emas.")
         return
 
+    prefs = await effective_preferences(update.effective_user.id)
     USER_DATA[update.effective_user.id] = {
         "chat_id": update.effective_chat.id,
         "filename": quiz["source_filename"],
@@ -833,8 +950,9 @@ async def private_load_saved_callback(update: Update, context: ContextTypes.DEFA
         "saved_quiz_id": quiz_id,
         "owner_username": update.effective_user.username,
         "owner_full_name": update.effective_user.full_name,
-        "shuffle_questions": False,
-        "shuffle_options": False,
+        "shuffle_questions": bool(prefs.get("shuffle_questions")),
+        "shuffle_options": bool(prefs.get("shuffle_options")),
+        "quiz_mode": prefs.get("quiz_mode", "practice"),
         "parser_total_blocks": len(quiz["questions"]),
     }
 
@@ -868,6 +986,7 @@ async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text("❌ Test topilmadi yoki sizga tegishli emas.")
         return
 
+    prefs = await effective_preferences(update.effective_user.id)
     GROUP_DATA[chat_id] = {
         "chat_id": chat_id,
         "filename": quiz["source_filename"],
@@ -882,8 +1001,9 @@ async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAUL
         "host_last_activity": time.time(),
         "last_leaderboard_text": None,
         "saved_quiz_id": quiz_id,
-        "shuffle_questions": False,
-        "shuffle_options": False,
+        "shuffle_questions": bool(prefs.get("shuffle_questions")),
+        "shuffle_options": bool(prefs.get("shuffle_options")),
+        "quiz_mode": prefs.get("quiz_mode", "practice"),
         "parser_total_blocks": len(quiz["questions"]),
     }
 
@@ -1137,48 +1257,76 @@ async def group_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-async def send_settings(message):
+async def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    prefs = await effective_preferences(user_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'✅' if prefs['shuffle_questions'] else '⬜'} Savollarni aralashtirish", callback_data="prefs_qshuffle")],
+        [InlineKeyboardButton(f"{'✅' if prefs['shuffle_options'] else '⬜'} Variantlarni aralashtirish", callback_data="prefs_oshuffle")],
+        [InlineKeyboardButton(quiz_mode_label(prefs.get("quiz_mode", "practice")), callback_data="prefs_mode")],
+        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
+    ])
+
+
+async def send_settings(message, user_id: int):
+    prefs = await effective_preferences(user_id)
     await message.reply_text(
-        "⚙️ Sozlamalar\n\n"
-        "Hozir vaqt har bir guruhni boshlashdan oldin tanlanadi:\n"
-        "10 / 15 / 20 / 30 / 40 / 60 soniya yoki 2 daqiqa.\n\n"
-        "Doimiy standart sozlamalar keyinroq qo‘shiladi.",
-        reply_markup=home_button(),
+        "⚙️ Standart sozlamalar\n\n"
+        "Bu sozlamalar yangi ochilgan testlarga avtomatik qo‘llanadi. "
+        "Bo‘lim hajmi va taymer esa har safar alohida tanlanadi.\n\n"
+        f"🔀 Savollar: {'yoqilgan' if prefs['shuffle_questions'] else 'o‘chirilgan'}\n"
+        f"🔀 Variantlar: {'yoqilgan' if prefs['shuffle_options'] else 'o‘chirilgan'}\n"
+        f"🎮 Rejim: {'Imtihon' if prefs['quiz_mode'] == 'exam' else 'Mashq'}",
+        reply_markup=await settings_keyboard(user_id),
     )
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_settings(update.message)
+    await send_settings(update.message, update.effective_user.id)
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await send_settings(query.message)
+    await send_settings(query.message, update.effective_user.id)
+
+
+async def prefs_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prefs = await effective_preferences(update.effective_user.id)
+    if query.data == "prefs_qshuffle":
+        changes = {"shuffle_questions": not prefs["shuffle_questions"]}
+    elif query.data == "prefs_oshuffle":
+        changes = {"shuffle_options": not prefs["shuffle_options"]}
+    else:
+        changes = {"quiz_mode": "exam" if prefs.get("quiz_mode") == "practice" else "practice"}
+    await db.update_user_preferences(
+        update.effective_user.id,
+        update.effective_user.username,
+        update.effective_user.full_name,
+        **changes,
+    )
+    await send_settings(query.message, update.effective_user.id)
+
+
+async def help_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Qo‘llab-quvvatlanadigan formatlar", callback_data="help_formats")],
+        [InlineKeyboardButton("🤖 AI bilan formatlash", callback_data="help_ai")],
+        [InlineKeyboardButton("🧪 Parser qanday ishlaydi?", callback_data="help_parser_info")],
+        [InlineKeyboardButton("ℹ️ Bot haqida", callback_data="help_about"), InlineKeyboardButton("🔐 Maxfiylik", callback_data="help_privacy")],
+        [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
+    ])
 
 
 async def send_help(message):
     await message.reply_text(
         "❓ Yordam\n\n"
-        "📄 Qo‘llab-quvvatlanadigan testlar:\n\n"
-        "FORMAT 1\n"
-        "1. Savol\nA) variant\nB) variant\nC) variant\nD) variant\nJavob: B\n\n"
-        "FORMAT 2\n"
-        "1. Savol\nA) variant\n+B) to‘g‘ri variant\nC) variant\nD) variant\n\n"
-        "Shuningdek *B), ✓B), ✔B) kabi aniq markerlar taniladi.\n\n"
-        "✅ Savol raqamidagi bo‘sh joy/nuqta xatolariga bot tolerant.\n"
-        "⚠️ To‘g‘ri javob topilmasa yoki bir nechta javob ko‘rsatilsa, bot savolni muammoli deb belgilaydi — taxmin qilmaydi.\n\n"
-        "🎮 Free imkoniyatlar:\n"
-        "• oyiga 1 ta yangi test import\n"
-        "• saqlangan testlarni cheksiz ishlash\n"
-        "• 30/40/50/100 bo‘limlar\n"
-        "• taymerlar\n"
-        "• savol va variantlarni aralashtirish\n"
-        "• xatolarni qayta mashq qilish\n"
-        "• natijalar tarixi\n"
-        "• guruh quiz va reyting\n\n"
-        "Buyruqlar: /start /new /quizzes /continue /pause /resume /stop /progress /group /skip /parser /plan /help",
-        reply_markup=home_button(),
+        "Test Tuzuvchi tayyor PDF/DOCX testlarni Telegram quizga aylantiradi, saqlaydi "
+        "va shaxsiy yoki guruh rejimida ishlashga yordam beradi.\n\n"
+        "⚠️ Har qanday hujjat avtomatik tanilmaydi. To‘g‘ri javob manbada aniq ko‘rsatilgan "
+        "bo‘lishi kerak. Bot javobni taxmin qilmaydi.",
+        reply_markup=await help_menu(),
     )
 
 
@@ -1192,15 +1340,82 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_help(query.message)
 
 
+async def help_formats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "✅ QO‘LLAB-QUVVATLANADIGAN ASOSIY FORMATLAR\n\n"
+        "1️⃣ Javob alohida yozilgan:\n\n"
+        "1. Savol matni\nA) Variant\nB) Variant\nC) Variant\nD) Variant\nJavob: B\n\n"
+        "2️⃣ To‘g‘ri variant belgi bilan ko‘rsatilgan:\n\n"
+        "1. Savol matni\nA) Variant\n+B) To‘g‘ri variant\nC) Variant\nD) Variant\n\n"
+        "Shuningdek *B), ✓B), ✔B) kabi markerlar taniladi. Savol raqamlari 1., 1), №1., № 1. ko‘rinishida bo‘lishi mumkin.\n\n"
+        "⚠️ Javob topilmasa yoki bir nechta javob belgilansa, bot savolni muammoli deb ko‘rsatadi va taxmin qilmaydi.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Yordam", callback_data="menu_help")]]),
+    )
+
+
+async def help_ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "🤖 FAYL FORMATI MOS EMASMI?\n\n"
+        "Hozirgi Bepul versiyada faylni ChatGPT, Gemini yoki boshqa AI vositasida mos formatga keltirib, keyin botga yuborish mumkin.\n\n"
+        "AI uchun tayyor buyruq:\n\n"
+        "Quyidagi testni faqat format jihatdan o‘zgartir. Savollar, variantlar va manbada ko‘rsatilgan to‘g‘ri javoblarni o‘zgartirma. "
+        "Yangi javob yaratma va to‘g‘ri javobni taxmin qilma. Har bir savolni: 1. Savol / A) / B) / C) / D) / Javob: B ko‘rinishiga keltir. "
+        "Agar manbada javob aniqlanmasa, Javob: — deb qoldir.\n\n"
+        "Keyingi bosqichda AI moslashtirishni botning o‘zida bajarish funksiyasi qo‘shilishi rejalashtirilgan.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Yordam", callback_data="menu_help")]]),
+    )
+
+
+async def help_parser_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "🧪 PARSER QANDAY ISHLAYDI?\n\n"
+        "1) Savol bloklarini topadi.\n2) Variantlarni ajratadi.\n3) Faqat manbada ko‘rsatilgan javobni qabul qiladi.\n"
+        "4) Noaniq savollarni muammoli deb hisobotda ko‘rsatadi.\n\n"
+        "/parser — joriy test hisobotini ko‘rish.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Yordam", callback_data="menu_help")]]),
+    )
+
+
+async def help_about_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "ℹ️ TEST TUZUVCHI HAQIDA\n\n"
+        "PDF/DOCX testlarni Telegram quizga aylantiring, saqlang va istalgancha mashq qiling.\n\n"
+        "⏱ Taymerlar\n🔀 Savol va variantlarni aralashtirish\n📖 Mashq / 📝 Imtihon rejimi\n"
+        "❌ Xatolarni kamaytirib qayta mashq qilish\n⏸ Pauza / ▶️ davom / 🛑 to‘xtatish\n"
+        "📊 Natijalar tarixi\n👥 Guruh testlari va reyting\n\n"
+        "🎁 Bepul tarif: oyiga 1 ta yangi test importi. Saqlangan testlarni qayta ishlash cheklanmagan.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Yordam", callback_data="menu_help")]]),
+    )
+
+
+async def help_privacy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "🔐 MAXFIYLIK\n\n"
+        "Bot ishlashi uchun Telegram ID, Telegramdagi ism/username, siz saqlagan testlar va natijalar ma’lumotlar bazasida saqlanishi mumkin.\n\n"
+        "Telefon raqamingiz hozirgi versiyada talab qilinmaydi va avtomatik olinmaydi.\n\n"
+        "Original PDF/DOCX faylni doimiy saqlash shart emas; quiz uchun ajratilgan savol va variantlar saqlanadi.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Yordam", callback_data="menu_help")]]),
+    )
+
 
 def parser_report_text(session: Optional[dict]) -> str:
     if not session or not session.get("questions"):
-        return "🧪 Hozircha parser report yo‘q. Avval test yuklang."
+        return "🧪 Hozircha parser hisoboti yo‘q. Avval test yuklang."
     total = int(session.get("parser_total_blocks") or (len(session.get("questions", [])) + len(session.get("warnings", []))))
     ready = len(session.get("questions", []))
     warnings = session.get("warnings", [])
     lines = [
-        "🧪 Parser report",
+        "🧪 Parser hisoboti",
         "",
         f"📄 {session.get('filename') or 'Test'}",
         f"🧩 Savol bloklari: {total}",
@@ -1349,7 +1564,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if not allowed:
                 await update.message.reply_text(
-                    "🔒 Free tarifda oyiga 1 ta yangi test import qilish mumkin.\n\n"
+                    "🔒 Bepul tarifda oyiga 1 ta yangi test import qilish mumkin.\n\n"
                     "Oldin saqlangan testlaringizni cheksiz ishlashingiz mumkin. "
                     "Yangi bepul import keyingi oyda ochiladi."
                 )
@@ -1390,6 +1605,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        prefs = await effective_preferences(user_id)
         session_data = {
             "chat_id": chat_id,
             "filename": filename,
@@ -1405,8 +1621,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "owner_full_name": user.full_name,
             "host_last_activity": time.time(),
             "last_leaderboard_text": None,
-            "shuffle_questions": False,
-            "shuffle_options": False,
+            "shuffle_questions": bool(prefs.get("shuffle_questions")),
+            "shuffle_options": bool(prefs.get("shuffle_options")),
+            "quiz_mode": prefs.get("quiz_mode", "practice"),
             "parser_total_blocks": total_blocks,
         }
 
@@ -1515,6 +1732,16 @@ async def private_toggle_options_callback(update: Update, context: ContextTypes.
     )
 
 
+async def private_toggle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = USER_DATA.get(update.effective_user.id)
+    if not session:
+        return
+    session["quiz_mode"] = "exam" if session.get("quiz_mode", "practice") == "practice" else "practice"
+    await query.edit_message_reply_markup(reply_markup=order_settings_keyboard(session, False))
+
+
 async def private_order_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1597,19 +1824,19 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("10 sec", callback_data=f"timer:{group_index}:10"),
-                InlineKeyboardButton("15 sec", callback_data=f"timer:{group_index}:15"),
+                InlineKeyboardButton("10 soniya", callback_data=f"timer:{group_index}:10"),
+                InlineKeyboardButton("15 soniya", callback_data=f"timer:{group_index}:15"),
             ],
             [
-                InlineKeyboardButton("20 sec", callback_data=f"timer:{group_index}:20"),
-                InlineKeyboardButton("30 sec", callback_data=f"timer:{group_index}:30"),
+                InlineKeyboardButton("20 soniya", callback_data=f"timer:{group_index}:20"),
+                InlineKeyboardButton("30 soniya", callback_data=f"timer:{group_index}:30"),
             ],
             [
-                InlineKeyboardButton("40 sec", callback_data=f"timer:{group_index}:40"),
-                InlineKeyboardButton("60 sec", callback_data=f"timer:{group_index}:60"),
+                InlineKeyboardButton("40 soniya", callback_data=f"timer:{group_index}:40"),
+                InlineKeyboardButton("60 soniya", callback_data=f"timer:{group_index}:60"),
             ],
             [
-                InlineKeyboardButton("2 min", callback_data=f"timer:{group_index}:120"),
+                InlineKeyboardButton("2 daqiqa", callback_data=f"timer:{group_index}:120"),
             ],
             [InlineKeyboardButton("📚 Guruhlar", callback_data="groups")],
             [InlineKeyboardButton("🏠 Bosh menyu", callback_data="menu_home")],
@@ -1745,6 +1972,7 @@ async def start_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "paused": False,
         "current_poll_id": None,
         "current_poll_message_id": None,
+        "quiz_mode": session.get("quiz_mode", "practice"),
     }
 
     try:
@@ -1756,8 +1984,9 @@ async def start_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🚀 {group_index + 1}-guruh boshlandi!\n"
         f"Jami {len(session['active']['questions'])} ta savol.\n"
         f"⏱ Har bir savol uchun: {format_duration(timer_seconds)}\n"
-        f"🔀 Savollar: {'ON' if session.get('shuffle_questions') else 'OFF'} · "
-        f"Variantlar: {'ON' if session.get('shuffle_options') else 'OFF'}"
+        f"🔀 Savollar: {'yoqilgan' if session.get('shuffle_questions') else 'o‘chirilgan'} · "
+        f"Variantlar: {'yoqilgan' if session.get('shuffle_options') else 'o‘chirilgan'}\n"
+        f"🎮 Rejim: {'Imtihon' if session.get('quiz_mode') == 'exam' else 'Mashq'}"
     )
     await send_next_question(chat_id, user_id, context)
 
@@ -1799,18 +2028,20 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
     timer_seconds = active["timer_seconds"]
 
     try:
-        msg = await context.bot.send_poll(
+        poll_kwargs = dict(
             chat_id=chat_id,
-            question=telegram_safe_question(
-                f"[{idx + 1}/{len(questions)}] {item['question']}"
-            ),
+            question=telegram_safe_question(f"[{idx + 1}/{len(questions)}] {item['question']}"),
             options=options,
-            type="quiz",
-            correct_option_id=displayed_correct_index,
             is_anonymous=False,
             allows_multiple_answers=False,
             open_period=timer_seconds,
         )
+        if active.get("quiz_mode", "practice") == "exam":
+            poll_kwargs["type"] = "regular"
+        else:
+            poll_kwargs["type"] = "quiz"
+            poll_kwargs["correct_option_id"] = displayed_correct_index
+        msg = await context.bot.send_poll(**poll_kwargs)
     except Exception:
         logging.exception("Could not send poll")
         await context.bot.send_message(
@@ -1829,6 +2060,7 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         "mode": "private",
         "user_id": user_id,
         "chat_id": chat_id,
+        "message_id": msg.message_id,
         "group_index": active["group_index"],
         "question_index": idx,
         "run_id": active["run_id"],
@@ -1913,6 +2145,7 @@ async def question_timeout(
         text=f"⏱ Vaqt tugadi. {question_index + 1}-savol javobsiz qoldi.",
     )
 
+    await asyncio.sleep(QUESTION_TRANSITION_DELAY)
     await send_next_question(chat_id, user_id, context)
 
 
@@ -1985,10 +2218,17 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Any submitted answer means the user is active again.
     active["empty_streak"] = 0
     active["current"] += 1
+    message_id = meta.get("message_id")
+    if message_id:
+        try:
+            await context.bot.stop_poll(meta["chat_id"], message_id)
+        except Exception:
+            pass
     active["current_poll_id"] = None
     active["current_poll_message_id"] = None
     POLL_MAP.pop(answer.poll_id, None)
 
+    await asyncio.sleep(QUESTION_TRANSITION_DELAY)
     await send_next_question(meta["chat_id"], user_id, context)
 
 
@@ -2187,6 +2427,18 @@ async def group_toggle_options_callback(update: Update, context: ContextTypes.DE
     )
 
 
+async def group_toggle_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = GROUP_DATA.get(update.effective_chat.id)
+    if not session or not group_controller_ok(update, session):
+        await query.answer("Faqat boshqaruvchi o‘zgartira oladi.", show_alert=True)
+        return
+    await query.answer()
+    session["quiz_mode"] = "exam" if session.get("quiz_mode", "practice") == "practice" else "practice"
+    touch_group_host(session)
+    await query.edit_message_reply_markup(reply_markup=order_settings_keyboard(session, True))
+
+
 async def group_order_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = update.effective_chat.id
@@ -2262,19 +2514,19 @@ async def group_quiz_group_callback(update: Update, context: ContextTypes.DEFAUL
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("10 sec", callback_data=f"gtimer:{group_index}:10"),
-                InlineKeyboardButton("15 sec", callback_data=f"gtimer:{group_index}:15"),
+                InlineKeyboardButton("10 soniya", callback_data=f"gtimer:{group_index}:10"),
+                InlineKeyboardButton("15 soniya", callback_data=f"gtimer:{group_index}:15"),
             ],
             [
-                InlineKeyboardButton("20 sec", callback_data=f"gtimer:{group_index}:20"),
-                InlineKeyboardButton("30 sec", callback_data=f"gtimer:{group_index}:30"),
+                InlineKeyboardButton("20 soniya", callback_data=f"gtimer:{group_index}:20"),
+                InlineKeyboardButton("30 soniya", callback_data=f"gtimer:{group_index}:30"),
             ],
             [
-                InlineKeyboardButton("40 sec", callback_data=f"gtimer:{group_index}:40"),
-                InlineKeyboardButton("60 sec", callback_data=f"gtimer:{group_index}:60"),
+                InlineKeyboardButton("40 soniya", callback_data=f"gtimer:{group_index}:40"),
+                InlineKeyboardButton("60 soniya", callback_data=f"gtimer:{group_index}:60"),
             ],
             [
-                InlineKeyboardButton("2 min", callback_data=f"gtimer:{group_index}:120"),
+                InlineKeyboardButton("2 daqiqa", callback_data=f"gtimer:{group_index}:120"),
             ],
             [InlineKeyboardButton("📚 Bo‘limlar", callback_data="ggroups")],
         ]
@@ -2408,6 +2660,7 @@ async def group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "current_answers": {},
         "current_poll_id": None,
         "current_poll_message_id": None,
+        "quiz_mode": session.get("quiz_mode", "practice"),
     }
 
     try:
@@ -2420,8 +2673,9 @@ async def group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         f"📘 {group_index + 1}-bo‘lim\n"
         f"❓ {len(session['active']['questions'])} ta savol\n"
         f"⏱ {format_duration(timer_seconds)}/savol\n"
-        f"🔀 Savollar: {'ON' if session.get('shuffle_questions') else 'OFF'} · "
-        f"Variantlar: {'ON' if session.get('shuffle_options') else 'OFF'}\n\n"
+        f"🔀 Savollar: {'yoqilgan' if session.get('shuffle_questions') else 'o‘chirilgan'} · "
+        f"Variantlar: {'yoqilgan' if session.get('shuffle_options') else 'o‘chirilgan'}\n"
+        f"🎮 Rejim: {'Imtihon' if session.get('quiz_mode') == 'exam' else 'Mashq'}\n\n"
         "Javob bergan bo‘lsangiz ham, keyingi savol taymer tugagach chiqadi."
     )
 
@@ -2456,18 +2710,20 @@ async def send_next_group_question(chat_id: int, context: ContextTypes.DEFAULT_T
     active["current_answers"] = {}
 
     try:
-        msg = await context.bot.send_poll(
+        poll_kwargs = dict(
             chat_id=chat_id,
-            question=telegram_safe_question(
-                f"[{idx + 1}/{len(questions)}] {item['question']}"
-            ),
+            question=telegram_safe_question(f"[{idx + 1}/{len(questions)}] {item['question']}"),
             options=options,
-            type="quiz",
-            correct_option_id=displayed_correct_index,
             is_anonymous=False,
             allows_multiple_answers=False,
             open_period=timer_seconds,
         )
+        if active.get("quiz_mode", "practice") == "exam":
+            poll_kwargs["type"] = "regular"
+        else:
+            poll_kwargs["type"] = "quiz"
+            poll_kwargs["correct_option_id"] = displayed_correct_index
+        msg = await context.bot.send_poll(**poll_kwargs)
     except Exception:
         logging.exception("Could not send group poll")
         await context.bot.send_message(
@@ -2643,6 +2899,7 @@ async def group_question_timeout(
         )
         return
 
+    await asyncio.sleep(QUESTION_TRANSITION_DELAY)
     await send_next_group_question(chat_id, context)
 
 
@@ -3152,6 +3409,7 @@ async def retry_wrong_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "paused": False,
         "current_poll_id": None,
         "current_poll_message_id": None,
+        "quiz_mode": "practice",
     }
 
     try:
@@ -3165,6 +3423,21 @@ async def retry_wrong_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         f"⏱ {format_duration(timer_seconds)}/savol"
     )
     await send_next_question(chat_id, user_id, context)
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if err:
+        logging.error("Botda kutilmagan xato", exc_info=(type(err), err, err.__traceback__))
+    try:
+        chat = getattr(update, "effective_chat", None)
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="⚠️ Texnik xato yuz berdi. Saqlangan testlaringiz bazada qoladi. /start orqali bosh menyuga qayting.",
+            )
+    except Exception:
+        logging.exception("Xato xabarini yuborib bo‘lmadi")
 
 
 def main():
@@ -3187,6 +3460,7 @@ def main():
     app.add_handler(CommandHandler("group", group_mode_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("pause", pause_quiz_command))
     app.add_handler(CommandHandler("resume", resume_quiz_command))
     app.add_handler(CommandHandler("stop", stop_group_command))
@@ -3203,13 +3477,19 @@ def main():
             handle_document,
         )
     )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
 
     app.add_handler(CallbackQueryHandler(home_callback, pattern=r"^menu_home$"))
     app.add_handler(CallbackQueryHandler(group_home_callback, pattern=r"^g_home$"))
     app.add_handler(CallbackQueryHandler(group_release_callback, pattern=r"^g_release$"))
     app.add_handler(CallbackQueryHandler(group_parser_callback, pattern=r"^g_parser$"))
     app.add_handler(CallbackQueryHandler(group_saved_callback, pattern=r"^g_saved$"))
+    app.add_handler(CallbackQueryHandler(private_quiz_detail_callback, pattern=r"^pquiz:\d+$"))
     app.add_handler(CallbackQueryHandler(private_load_saved_callback, pattern=r"^pload:\d+$"))
+    app.add_handler(CallbackQueryHandler(private_rename_quiz_callback, pattern=r"^prename:\d+$"))
+    app.add_handler(CallbackQueryHandler(private_delete_quiz_callback, pattern=r"^pdelete:\d+$"))
+    app.add_handler(CallbackQueryHandler(private_delete_quiz_yes_callback, pattern=r"^pdeleteyes:\d+$"))
+    app.add_handler(CallbackQueryHandler(private_quiz_results_callback, pattern=r"^presults:\d+$"))
     app.add_handler(CallbackQueryHandler(group_load_saved_callback, pattern=r"^gload:\d+$"))
     app.add_handler(CallbackQueryHandler(group_stop_yes_callback, pattern=r"^gstop_yes$"))
     app.add_handler(CallbackQueryHandler(group_stop_no_callback, pattern=r"^gstop_no$"))
@@ -3223,15 +3503,23 @@ def main():
     app.add_handler(CallbackQueryHandler(progress_callback, pattern=r"^menu_progress$"))
     app.add_handler(CallbackQueryHandler(group_mode_callback, pattern=r"^menu_group$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^menu_settings$"))
+    app.add_handler(CallbackQueryHandler(prefs_toggle_callback, pattern=r"^prefs_(?:qshuffle|oshuffle|mode)$"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^menu_help$"))
+    app.add_handler(CallbackQueryHandler(help_formats_callback, pattern=r"^help_formats$"))
+    app.add_handler(CallbackQueryHandler(help_ai_callback, pattern=r"^help_ai$"))
+    app.add_handler(CallbackQueryHandler(help_parser_info_callback, pattern=r"^help_parser_info$"))
+    app.add_handler(CallbackQueryHandler(help_about_callback, pattern=r"^help_about$"))
+    app.add_handler(CallbackQueryHandler(help_privacy_callback, pattern=r"^help_privacy$"))
     app.add_handler(CallbackQueryHandler(help_upload_callback, pattern=r"^help_upload$"))
     app.add_handler(CallbackQueryHandler(choose_size_callback, pattern=r"^size:\d+$"))
     app.add_handler(CallbackQueryHandler(private_toggle_questions_callback, pattern=r"^ptoq$"))
     app.add_handler(CallbackQueryHandler(private_toggle_options_callback, pattern=r"^ptoa$"))
+    app.add_handler(CallbackQueryHandler(private_toggle_mode_callback, pattern=r"^ptomode$"))
     app.add_handler(CallbackQueryHandler(private_order_done_callback, pattern=r"^porderdone$"))
     app.add_handler(CallbackQueryHandler(group_choose_size_callback, pattern=r"^gsize:\d+$"))
     app.add_handler(CallbackQueryHandler(group_toggle_questions_callback, pattern=r"^gtoq$"))
     app.add_handler(CallbackQueryHandler(group_toggle_options_callback, pattern=r"^gtoa$"))
+    app.add_handler(CallbackQueryHandler(group_toggle_mode_callback, pattern=r"^gtomode$"))
     app.add_handler(CallbackQueryHandler(group_order_done_callback, pattern=r"^gorderdone$"))
     app.add_handler(CallbackQueryHandler(group_quiz_group_callback, pattern=r"^ggroup:\d+$"))
     app.add_handler(CallbackQueryHandler(group_groups_callback, pattern=r"^ggroups$"))
@@ -3244,7 +3532,8 @@ def main():
     app.add_handler(CallbackQueryHandler(start_group_callback, pattern=r"^startgroup:\d+:(?:10|15|20|30|40|60|120)$"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
-    logging.info("Exam Quiz prototype started.")
+    app.add_error_handler(global_error_handler)
+    logging.info("Test Tuzuvchi ishga tushdi.")
     app.run_polling(drop_pending_updates=True)
 
 
