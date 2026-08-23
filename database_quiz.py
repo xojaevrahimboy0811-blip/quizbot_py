@@ -1,11 +1,11 @@
 import os
 import json
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 try:
     import asyncpg
-except ImportError:  # lets the bot still start if requirements were not updated yet
+except ImportError:
     asyncpg = None
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -63,10 +63,38 @@ async def init_pool() -> bool:
                 UNIQUE(quiz_id, position)
             );
 
+            CREATE TABLE IF NOT EXISTS monthly_imports (
+                user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                month_start DATE NOT NULL,
+                import_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, month_start)
+            );
+
+            CREATE TABLE IF NOT EXISTS attempts (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                quiz_id BIGINT REFERENCES quizzes(id) ON DELETE SET NULL,
+                mode TEXT NOT NULL DEFAULT 'private',
+                chat_id BIGINT,
+                section_index INTEGER,
+                total INTEGER NOT NULL,
+                correct INTEGER NOT NULL,
+                wrong INTEGER NOT NULL,
+                unanswered INTEGER NOT NULL DEFAULT 0,
+                percent INTEGER NOT NULL,
+                best_streak INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
             CREATE INDEX IF NOT EXISTS idx_quizzes_owner
                 ON quizzes(owner_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_questions_quiz
                 ON questions(quiz_id, position);
+            CREATE INDEX IF NOT EXISTS idx_attempts_user
+                ON attempts(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_attempts_quiz
+                ON attempts(quiz_id, created_at DESC);
             """
         )
     logging.info("Persistent quiz database initialized.")
@@ -93,13 +121,99 @@ async def ensure_user(user_id: int, username: Optional[str], full_name: Optional
             INSERT INTO users (telegram_id, username, full_name)
             VALUES ($1, $2, $3)
             ON CONFLICT (telegram_id) DO UPDATE SET
-                username = EXCLUDED.username,
-                full_name = EXCLUDED.full_name,
+                username = COALESCE(EXCLUDED.username, users.username),
+                full_name = COALESCE(EXCLUDED.full_name, users.full_name),
                 updated_at = NOW()
             """,
             user_id,
             username,
             full_name,
+        )
+
+
+async def get_plan_status(user_id: int, free_limit: int = 1) -> Dict[str, Any]:
+    if not _POOL:
+        return {
+            "plan": "free",
+            "is_pro": False,
+            "imports_used": 0,
+            "imports_limit": free_limit,
+            "imports_remaining": free_limit,
+        }
+
+    async with _POOL.acquire() as conn:
+        user = await conn.fetchrow(
+            """
+            SELECT plan, pro_expires_at,
+                   (plan = 'pro' AND (pro_expires_at IS NULL OR pro_expires_at > NOW())) AS is_pro
+            FROM users
+            WHERE telegram_id=$1
+            """,
+            user_id,
+        )
+        used = await conn.fetchval(
+            """
+            SELECT COALESCE(import_count, 0)
+            FROM monthly_imports
+            WHERE user_id=$1 AND month_start=date_trunc('month', CURRENT_DATE)::date
+            """,
+            user_id,
+        )
+
+    used = int(used or 0)
+    is_pro = bool(user and user["is_pro"])
+    plan = user["plan"] if user else "free"
+    return {
+        "plan": plan,
+        "is_pro": is_pro,
+        "imports_used": used,
+        "imports_limit": None if is_pro else free_limit,
+        "imports_remaining": None if is_pro else max(0, free_limit - used),
+    }
+
+
+async def quiz_exists_by_filename(owner_id: int, filename: str) -> bool:
+    if not _POOL:
+        return False
+    async with _POOL.acquire() as conn:
+        return bool(
+            await conn.fetchval(
+                "SELECT 1 FROM quizzes WHERE owner_id=$1 AND source_filename=$2",
+                owner_id,
+                filename,
+            )
+        )
+
+
+async def can_import_new_quiz(owner_id: int, filename: str, free_limit: int = 1) -> Tuple[bool, str]:
+    """Allow replacing an already-saved filename without consuming a new monthly slot."""
+    if not _POOL:
+        return True, "database_disabled"
+
+    if await quiz_exists_by_filename(owner_id, filename):
+        return True, "existing_quiz_update"
+
+    status = await get_plan_status(owner_id, free_limit=free_limit)
+    if status["is_pro"]:
+        return True, "pro"
+    if status["imports_used"] < free_limit:
+        return True, "free_slot"
+    return False, "monthly_limit"
+
+
+async def record_new_import(user_id: int) -> None:
+    if not _POOL:
+        return
+    async with _POOL.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO monthly_imports (user_id, month_start, import_count)
+            VALUES ($1, date_trunc('month', CURRENT_DATE)::date, 1)
+            ON CONFLICT (user_id, month_start) DO UPDATE SET
+                import_count = monthly_imports.import_count + 1,
+                updated_at = NOW()
+            """,
+            user_id,
         )
 
 
@@ -110,7 +224,7 @@ async def save_quiz(
     filename: str,
     questions: List[dict],
     display_name: Optional[str] = None,
-) -> Optional[int]:
+) -> Optional[Dict[str, Any]]:
     if not _POOL:
         return None
 
@@ -124,6 +238,7 @@ async def save_quiz(
                 owner_id,
                 filename,
             )
+            created_new = quiz_id is None
 
             if quiz_id:
                 await conn.execute(
@@ -163,19 +278,23 @@ async def save_quiz(
                     )
                 )
 
-            await conn.executemany(
-                """
-                INSERT INTO questions
-                    (quiz_id, position, source_number, question, options, correct_index)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6)
-                """,
-                rows,
-            )
+            if rows:
+                await conn.executemany(
+                    """
+                    INSERT INTO questions
+                        (quiz_id, position, source_number, question, options, correct_index)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                    """,
+                    rows,
+                )
 
-    return int(quiz_id)
+    if created_new:
+        await record_new_import(owner_id)
+
+    return {"quiz_id": int(quiz_id), "created_new": bool(created_new)}
 
 
-async def list_quizzes(owner_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+async def list_quizzes(owner_id: int, limit: int = 50) -> List[Dict[str, Any]]:
     if not _POOL:
         return []
     async with _POOL.acquire() as conn:
@@ -249,3 +368,66 @@ async def delete_quiz(owner_id: int, quiz_id: int) -> bool:
             owner_id,
         )
     return status.endswith("1")
+
+
+async def save_attempt(
+    user_id: int,
+    username: Optional[str],
+    full_name: Optional[str],
+    quiz_id: Optional[int],
+    mode: str,
+    chat_id: Optional[int],
+    section_index: Optional[int],
+    total: int,
+    correct: int,
+    wrong: int,
+    unanswered: int,
+    percent: int,
+    best_streak: int,
+) -> Optional[int]:
+    if not _POOL:
+        return None
+
+    await ensure_user(user_id, username, full_name)
+    async with _POOL.acquire() as conn:
+        return await conn.fetchval(
+            """
+            INSERT INTO attempts
+                (user_id, quiz_id, mode, chat_id, section_index,
+                 total, correct, wrong, unanswered, percent, best_streak)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            RETURNING id
+            """,
+            user_id,
+            quiz_id,
+            mode,
+            chat_id,
+            section_index,
+            total,
+            correct,
+            wrong,
+            unanswered,
+            percent,
+            best_streak,
+        )
+
+
+async def list_recent_attempts(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    if not _POOL:
+        return []
+    async with _POOL.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT a.id, a.mode, a.section_index, a.total, a.correct, a.wrong,
+                   a.unanswered, a.percent, a.best_streak, a.created_at,
+                   q.name AS quiz_name
+            FROM attempts a
+            LEFT JOIN quizzes q ON q.id=a.quiz_id
+            WHERE a.user_id=$1
+            ORDER BY a.created_at DESC
+            LIMIT $2
+            """,
+            user_id,
+            limit,
+        )
+    return [dict(r) for r in rows]
