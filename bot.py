@@ -2,6 +2,8 @@ import os
 import re
 import logging
 import asyncio
+import random
+import time
 from io import BytesIO
 from math import ceil
 from typing import List, Dict, Optional, Tuple
@@ -40,6 +42,9 @@ GROUP_SIZES = [30, 40, 50, 100]
 # Telegram supports timed polls. These are the study choices shown before Start.
 TIMER_CHOICES = [10, 15, 20, 30, 40, 60, 120]
 GROUP_EMPTY_STOP_THRESHOLD = 3
+GROUP_SETUP_TTL_SECONDS = 15 * 60
+FREE_IMPORT_LIMIT = 1
+OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or 0)
 
 
 def format_duration(seconds: int) -> str:
@@ -48,6 +53,85 @@ def format_duration(seconds: int) -> str:
     if seconds == 120:
         return "2 daqiqa"
     return f"{seconds} soniya"
+
+
+def is_owner(user_id: int) -> bool:
+    return bool(OWNER_TELEGRAM_ID and user_id == OWNER_TELEGRAM_ID)
+
+
+def prepare_poll_options(item: dict, shuffle_options: bool) -> Tuple[List[str], int]:
+    """Return displayed options + the correct index after optional shuffling."""
+    order = list(range(len(item["options"])))
+    if shuffle_options:
+        random.shuffle(order)
+    displayed = [item["options"][i] for i in order]
+    correct_original = int(item["correct_index"])
+    correct_displayed = order.index(correct_original)
+    return displayed, correct_displayed
+
+
+def apply_question_order(session: dict) -> List[dict]:
+    ordered = list(session.get("questions", []))
+    if session.get("shuffle_questions"):
+        random.shuffle(ordered)
+    return ordered
+
+
+def host_is_stale(session: Optional[dict]) -> bool:
+    if not session or session.get("active"):
+        return False
+    last = float(session.get("host_last_activity") or 0)
+    return bool(last and (time.time() - last) > GROUP_SETUP_TTL_SECONDS)
+
+
+def clean_stale_group_host(chat_id: int) -> None:
+    session = GROUP_DATA.get(chat_id)
+    if host_is_stale(session):
+        GROUP_DATA.pop(chat_id, None)
+
+
+def claim_group_host(chat_id: int, user) -> Tuple[bool, Optional[str]]:
+    """One controller per Telegram group. Stale setup locks are released automatically."""
+    clean_stale_group_host(chat_id)
+    session = GROUP_DATA.get(chat_id)
+    if session and session.get("controller_id") not in (None, user.id):
+        return False, session.get("controller_name") or "boshqa foydalanuvchi"
+
+    if not session:
+        GROUP_DATA[chat_id] = {
+            "chat_id": chat_id,
+            "filename": None,
+            "questions": [],
+            "warnings": [],
+            "group_size": None,
+            "groups": [],
+            "active": None,
+            "results": {},
+            "controller_id": user.id,
+            "controller_name": user.full_name,
+            "host_last_activity": time.time(),
+            "last_leaderboard_text": None,
+            "shuffle_questions": False,
+            "shuffle_options": False,
+        }
+    else:
+        session["controller_id"] = user.id
+        session["controller_name"] = user.full_name
+        session["host_last_activity"] = time.time()
+    return True, None
+
+
+def touch_group_host(session: dict) -> None:
+    session["host_last_activity"] = time.time()
+
+
+def release_group_host(chat_id: int) -> None:
+    session = GROUP_DATA.get(chat_id)
+    if not session:
+        return
+    if session.get("active"):
+        return
+    GROUP_DATA.pop(chat_id, None)
 
 
 # -----------------------------
@@ -396,8 +480,49 @@ def group_home_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📚 Joriy test", callback_data="g_current"),
                 InlineKeyboardButton("🏆 Oxirgi reyting", callback_data="g_leaderboard"),
             ],
+            [
+                InlineKeyboardButton("🧪 Parser report", callback_data="g_parser"),
+                InlineKeyboardButton("🔓 Sessiyani tugatish", callback_data="g_release"),
+            ],
             [InlineKeyboardButton("❓ Yordam", callback_data="g_help")],
         ]
+    )
+
+
+def order_settings_keyboard(session: dict, group_mode: bool) -> InlineKeyboardMarkup:
+    q_on = bool(session.get("shuffle_questions"))
+    a_on = bool(session.get("shuffle_options"))
+    if group_mode:
+        q_cb, a_cb, done_cb, back_cb = "gtoq", "gtoa", "gorderdone", "g_home"
+    else:
+        q_cb, a_cb, done_cb, back_cb = "ptoq", "ptoa", "porderdone", "menu_home"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{'✅' if q_on else '⬜'} Savollarni aralashtirish",
+                    callback_data=q_cb,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'✅' if a_on else '⬜'} Variantlarni aralashtirish",
+                    callback_data=a_cb,
+                )
+            ],
+            [InlineKeyboardButton("➡️ Davom etish", callback_data=done_cb)],
+            [InlineKeyboardButton("← Orqaga", callback_data=back_cb)],
+        ]
+    )
+
+
+async def send_order_settings(message, session: dict, group_mode: bool):
+    await message.reply_text(
+        "🔀 Quiz tartibini tanlang\n\n"
+        "Savollarni aralashtirish — savollar boshqa tartibda beriladi.\n"
+        "Variantlarni aralashtirish — A/B/C/D joylashuvi har savolda o‘zgaradi, "
+        "lekin to‘g‘ri javob avtomatik moslashtiriladi.",
+        reply_markup=order_settings_keyboard(session, group_mode),
     )
 
 
@@ -410,13 +535,21 @@ async def send_home(message):
 
 
 async def send_group_home(message):
+    chat_id = message.chat.id
+    clean_stale_group_host(chat_id)
+    session = GROUP_DATA.get(chat_id)
+    host_text = "👤 Boshqaruvchi: yo‘q"
+    if session and session.get("controller_id"):
+        host_text = f"👤 Boshqaruvchi: {session.get('controller_name') or 'foydalanuvchi'}"
+
     await message.reply_text(
         "👥 Exam Quiz Bot — guruh rejimi\n\n"
-        "Bir xil savol barcha qatnashchilarga beriladi. "
-        "Javob berganlar ham vaqt tugaguncha kutadi. "
-        "Keyingi savol faqat taymer tugagach chiqadi.\n\n"
-        "Istalgan foydalanuvchi o‘zining saqlangan testini tanlashi yoki yangi PDF/DOCX yuborishi mumkin.\n\n"
-        "Boshqaruvchi buyruqlari: /stop va /skip",
+        f"{host_text}\n\n"
+        "Quizni boshlash uchun /group yuboring yoki ‘Mening testlarim’/‘Test yuklash’ni bosing. "
+        "Bir vaqtda faqat bitta foydalanuvchi quizni boshqaradi.\n\n"
+        "Savol taymeri tugamaguncha keyingi savol chiqmaydi. "
+        f"{GROUP_EMPTY_STOP_THRESHOLD} ta ketma-ket savolga hech kim javob bermasa, quiz avtomatik to‘xtaydi.\n\n"
+        "Boshqaruvchi: /stop · /skip",
         reply_markup=group_home_keyboard(),
     )
 
@@ -449,18 +582,28 @@ async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_new_quiz_prompt(message):
     await message.reply_text(
         "📄 Yangi test\n\n"
-        "PDF yoki Word (.docx) test faylini shu chatga yuboring.\n"
-        "Men savollarni aniqlayman va keyin ularni 30 / 40 / 50 / 100 savoldan "
-        "guruhlarga ajratishga imkon beraman.",
+        "PDF yoki Word (.docx) test faylini yuboring.\n\n"
+        "✅ Asosiy taniladigan javob formatlari:\n"
+        "• Javob: B / Answer: B\n"
+        "• +B) ... / *B) ... / ✓B) ...\n\n"
+        "Savol raqamida nuqta yoki bo‘sh joy tushib qolsa ham bot imkon qadar savolni taniydi. "
+        "Bot to‘g‘ri javobni taxmin qilmaydi.\n\n"
+        "🎁 Free: oyiga 1 ta yangi test import. Saqlangan testlarni cheksiz ishlash mumkin.",
         reply_markup=home_button(),
     )
 
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update.effective_chat):
+        ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+        if not ok:
+            await update.message.reply_text(
+                f"🔒 Hozir {host_name} guruh quizini boshqaryapti."
+            )
+            return
         await update.message.reply_text(
-            "📄 PDF yoki DOCX test faylini shu guruhga yuboring. "
-            "Faylni yuborgan foydalanuvchi quiz boshqaruvchisi bo‘ladi."
+            "📄 PDF yoki DOCX test faylini shu guruhga yuboring.\n"
+            "Siz quiz boshqaruvchisisiz."
         )
     else:
         await send_new_quiz_prompt(update.message)
@@ -547,10 +690,18 @@ async def show_saved_quizzes(message, tg_user, group_mode: bool = False):
 
 
 async def quizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    group_mode = is_group_chat(update.effective_chat)
+    if group_mode:
+        ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+        if not ok:
+            await update.message.reply_text(
+                f"🔒 Hozir {host_name} guruh quizini boshqaryapti."
+            )
+            return
     await show_saved_quizzes(
         update.message,
         update.effective_user,
-        group_mode=is_group_chat(update.effective_chat),
+        group_mode=group_mode,
     )
 
 
@@ -562,6 +713,10 @@ async def quizzes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def group_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+    if not ok:
+        await query.answer(f"Hozir {host_name} boshqaryapti.", show_alert=True)
+        return
     await query.answer()
     await show_saved_quizzes(query.message, update.effective_user, group_mode=True)
 
@@ -589,6 +744,11 @@ async def private_load_saved_callback(update: Update, context: ContextTypes.DEFA
         "active": None,
         "results": {},
         "saved_quiz_id": quiz_id,
+        "owner_username": update.effective_user.username,
+        "owner_full_name": update.effective_user.full_name,
+        "shuffle_questions": False,
+        "shuffle_options": False,
+        "parser_total_blocks": len(quiz["questions"]),
     }
 
     await query.message.reply_text(
@@ -601,7 +761,16 @@ async def private_load_saved_callback(update: Update, context: ContextTypes.DEFA
 
 async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    chat_id = update.effective_chat.id
+    ok, host_name = claim_group_host(chat_id, update.effective_user)
+    if not ok:
+        await query.answer(
+            f"Bu guruh quizini hozir {host_name} boshqaryapti.",
+            show_alert=True,
+        )
+        return
     await query.answer()
+
     if not db.is_enabled():
         await query.message.reply_text("❌ Database ulanmagan.")
         return
@@ -612,8 +781,8 @@ async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text("❌ Test topilmadi yoki sizga tegishli emas.")
         return
 
-    GROUP_DATA[update.effective_chat.id] = {
-        "chat_id": update.effective_chat.id,
+    GROUP_DATA[chat_id] = {
+        "chat_id": chat_id,
         "filename": quiz["source_filename"],
         "questions": quiz["questions"],
         "warnings": [],
@@ -622,12 +791,17 @@ async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAUL
         "active": None,
         "results": {},
         "controller_id": update.effective_user.id,
+        "controller_name": update.effective_user.full_name,
+        "host_last_activity": time.time(),
         "last_leaderboard_text": None,
         "saved_quiz_id": quiz_id,
+        "shuffle_questions": False,
+        "shuffle_options": False,
+        "parser_total_blocks": len(quiz["questions"]),
     }
 
     await query.message.reply_text(
-        f"✅ {update.effective_user.full_name} o‘z testini tanladi.\n\n"
+        f"✅ {update.effective_user.full_name} boshqaruvchi bo‘ldi.\n\n"
         f"📘 {quiz['name']}\n"
         f"❓ {len(quiz['questions'])} ta savol\n\n"
         "Har bir bo‘limda nechta savol bo‘lsin?",
@@ -682,23 +856,33 @@ async def continue_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_progress(message, user_id: int):
+    if db.is_enabled():
+        try:
+            attempts = await db.list_recent_attempts(user_id, limit=10)
+        except Exception:
+            logging.exception("Could not load attempt history")
+            attempts = []
+        if attempts:
+            lines = ["📊 Oxirgi natijalar\n"]
+            for row in attempts:
+                name = row.get("quiz_name") or "Test"
+                mode = "👥" if row.get("mode") == "group" else "📘"
+                section = row.get("section_index")
+                section_text = f" · {section + 1}-bo‘lim" if section is not None else ""
+                lines.append(
+                    f"{mode} {name}{section_text} — "
+                    f"{row['correct']}/{row['total']} ({row['percent']}%)"
+                )
+            await message.reply_text("\n".join(lines), reply_markup=home_button())
+            return
+
     session = USER_DATA.get(user_id)
-    if not session:
-        await message.reply_text(
-            "📊 Hozircha natijalar yo‘q.",
-            reply_markup=home_button(),
-        )
-        return
-
-    results = session.get("results", {})
+    results = (session or {}).get("results", {})
     if not results:
-        await message.reply_text(
-            "📊 Hozircha tugallangan guruh natijalari yo‘q.",
-            reply_markup=home_button(),
-        )
+        await message.reply_text("📊 Hozircha natijalar yo‘q.", reply_markup=home_button())
         return
 
-    lines = ["📊 Natijalar\n"]
+    lines = ["📊 Joriy sessiya natijalari\n"]
     for idx in sorted(results):
         result = results[idx]
         unanswered = result.get("unanswered", 0)
@@ -707,11 +891,7 @@ async def show_progress(message, user_id: int):
             f"({result['percent']}%)"
             + (f" · javobsiz {unanswered}" if unanswered else "")
         )
-
-    await message.reply_text(
-        "\n".join(lines),
-        reply_markup=home_button(),
-    )
+    await message.reply_text("\n".join(lines), reply_markup=home_button())
 
 
 async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -753,6 +933,19 @@ async def send_group_mode_info(message, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def group_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update.effective_chat):
+        ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+        if not ok:
+            await update.message.reply_text(
+                f"🔒 Bu guruh quizini hozir {host_name} boshqaryapti. "
+                "Quiz tugagach yoki sessiya bo‘shatilgach yana urinib ko‘ring."
+            )
+            return
+        await update.message.reply_text(
+            f"🎮 {update.effective_user.full_name} guruh quiz boshqaruvchisi bo‘ldi."
+        )
+        await send_group_home(update.message)
+        return
     await send_group_mode_info(update.message, context)
 
 
@@ -770,10 +963,14 @@ async def group_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def group_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+    if not ok:
+        await query.answer(f"Hozir {host_name} boshqaryapti.", show_alert=True)
+        return
     await query.answer()
     await query.message.reply_text(
         "📄 PDF yoki DOCX test faylini shu guruhga yuboring.\n\n"
-        "Faylni yuborgan foydalanuvchi ushbu quizning boshqaruvchisi bo‘ladi."
+        "Siz quiz boshqaruvchisisiz. Boshqa foydalanuvchi sizning setupingizni almashtira olmaydi."
     )
 
 
@@ -865,14 +1062,24 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_help(message):
     await message.reply_text(
         "❓ Yordam\n\n"
-        "1) 📄 Yangi test orqali PDF yoki DOCX yuboring.\n"
-        "2) Bot savol bloklari va to‘g‘ri javoblarni aniqlaydi.\n"
-        "3) 30 / 40 / 50 / 100 savollik guruh hajmini tanlang.\n"
-        "4) Guruhni tanlang.\n"
-        "5) Har bir savol uchun vaqtni tanlang.\n"
-        "6) ▶️ START ni bosing.\n\n"
-        "Asosiy buyruqlar:\n"
-        "/start /new /quizzes /continue /progress /group /settings /help",
+        "📄 Qo‘llab-quvvatlanadigan testlar:\n\n"
+        "FORMAT 1\n"
+        "1. Savol\nA) variant\nB) variant\nC) variant\nD) variant\nJavob: B\n\n"
+        "FORMAT 2\n"
+        "1. Savol\nA) variant\n+B) to‘g‘ri variant\nC) variant\nD) variant\n\n"
+        "Shuningdek *B), ✓B), ✔B) kabi aniq markerlar taniladi.\n\n"
+        "✅ Savol raqamidagi bo‘sh joy/nuqta xatolariga bot tolerant.\n"
+        "⚠️ To‘g‘ri javob topilmasa yoki bir nechta javob ko‘rsatilsa, bot savolni muammoli deb belgilaydi — taxmin qilmaydi.\n\n"
+        "🎮 Free imkoniyatlar:\n"
+        "• oyiga 1 ta yangi test import\n"
+        "• saqlangan testlarni cheksiz ishlash\n"
+        "• 30/40/50/100 bo‘limlar\n"
+        "• taymerlar\n"
+        "• savol va variantlarni aralashtirish\n"
+        "• xatolarni qayta mashq qilish\n"
+        "• natijalar tarixi\n"
+        "• guruh quiz va reyting\n\n"
+        "Buyruqlar: /start /new /quizzes /continue /progress /group /stop /skip /parser /plan /help",
         reply_markup=home_button(),
     )
 
@@ -887,9 +1094,98 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_help(query.message)
 
 
+
+def parser_report_text(session: Optional[dict]) -> str:
+    if not session or not session.get("questions"):
+        return "🧪 Hozircha parser report yo‘q. Avval test yuklang."
+    total = int(session.get("parser_total_blocks") or (len(session.get("questions", [])) + len(session.get("warnings", []))))
+    ready = len(session.get("questions", []))
+    warnings = session.get("warnings", [])
+    lines = [
+        "🧪 Parser report",
+        "",
+        f"📄 {session.get('filename') or 'Test'}",
+        f"🧩 Savol bloklari: {total}",
+        f"✅ Quizga tayyor: {ready}",
+        f"⚠️ Muammoli: {len(warnings)}",
+    ]
+    if warnings:
+        lines.append("")
+        lines.append("Muammolar:")
+        lines.extend(f"• {w}" for w in warnings[:15])
+        if len(warnings) > 15:
+            lines.append(f"• ... yana {len(warnings) - 15} ta")
+    return "\n".join(lines)
+
+
+async def parser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_group_chat(update.effective_chat):
+        session = GROUP_DATA.get(update.effective_chat.id)
+    else:
+        session = USER_DATA.get(update.effective_user.id)
+    await update.message.reply_text(parser_report_text(session))
+
+
+async def group_parser_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(parser_report_text(GROUP_DATA.get(update.effective_chat.id)))
+
+
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_owner(user.id):
+        await update.message.reply_text(
+            "🛠 Owner/Test rejimi\nYangi test importlari cheklanmagan."
+        )
+        return
+    if not db.is_enabled():
+        await update.message.reply_text("⚠️ Database ulanmagan, tarif holatini aniqlab bo‘lmaydi.")
+        return
+    try:
+        await db.ensure_user(user.id, user.username, user.full_name)
+        status = await db.get_plan_status(user.id, free_limit=FREE_IMPORT_LIMIT)
+    except Exception:
+        logging.exception("Could not load plan")
+        await update.message.reply_text("❌ Tarif holatini yuklab bo‘lmadi.")
+        return
+    if status.get("is_pro"):
+        text = "⭐ PRO\nCheksiz yangi test importlari."
+    else:
+        text = (
+            "🆓 FREE\n"
+            f"Bu oy yangi import: {status['imports_used']}/{FREE_IMPORT_LIMIT}\n"
+            f"Qolgan: {status['imports_remaining']}\n\n"
+            "Saqlangan testlarni ishlash cheklanmagan."
+        )
+    await update.message.reply_text(text)
+
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Sizning Telegram ID: {update.effective_user.id}")
+
+
+async def group_release_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = GROUP_DATA.get(update.effective_chat.id)
+    if not session:
+        await query.answer("Sessiya yo‘q", show_alert=True)
+        return
+    if not group_controller_ok(update, session):
+        await query.answer("Faqat boshqaruvchi sessiyani bo‘shata oladi.", show_alert=True)
+        return
+    if session.get("active"):
+        await query.answer("Avval /stop bilan faol quizni to‘xtating.", show_alert=True)
+        return
+    await query.answer()
+    GROUP_DATA.pop(update.effective_chat.id, None)
+    await query.message.reply_text("🔓 Guruh quiz boshqaruvi bo‘shatildi. Endi boshqa foydalanuvchi boshlashi mumkin.")
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     chat_id = update.effective_chat.id
     group_mode = is_group_chat(update.effective_chat)
 
@@ -899,6 +1195,38 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (lower.endswith(".pdf") or lower.endswith(".docx")):
         await update.message.reply_text("❌ Hozircha faqat PDF va DOCX fayllar qabul qilinadi.")
         return
+
+    # In groups, an upload is part of the host's setup. Do not let a second user
+    # overwrite another person's quiz session.
+    if group_mode:
+        ok, host_name = claim_group_host(chat_id, user)
+        if not ok:
+            await update.message.reply_text(
+                f"🔒 Bu guruh quizini hozir {host_name} boshqaryapti. "
+                "Uning sessiyasi tugagach test yuklang."
+            )
+            return
+
+    # Free plan: one NEW saved quiz import per calendar month.
+    # Re-uploading the same filename is treated as an update and does not consume
+    # another slot. OWNER_TELEGRAM_ID bypasses this during private testing.
+    if db.is_enabled() and not is_owner(user_id):
+        try:
+            await db.ensure_user(user_id, user.username, user.full_name)
+            allowed, reason = await db.can_import_new_quiz(
+                user_id,
+                filename,
+                free_limit=FREE_IMPORT_LIMIT,
+            )
+            if not allowed:
+                await update.message.reply_text(
+                    "🔒 Free tarifda oyiga 1 ta yangi test import qilish mumkin.\n\n"
+                    "Oldin saqlangan testlaringizni cheksiz ishlashingiz mumkin. "
+                    "Yangi bepul import keyingi oyda ochiladi."
+                )
+                return
+        except Exception:
+            logging.exception("Could not verify monthly import limit")
 
     status = await update.message.reply_text("📥 Fayl o‘qilmoqda...")
 
@@ -915,19 +1243,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text.strip():
             await status.edit_text(
                 "❌ Fayldan matn topilmadi.\n"
-                "Agar bu skanerlangan PDF bo‘lsa, keyingi versiyada OCR qo‘shamiz."
+                "Skanerlangan/rasm ko‘rinishidagi PDF hozircha qo‘llab-quvvatlanmaydi."
             )
             return
 
         await status.edit_text("🔎 Test savollari aniqlanmoqda...")
         questions, warnings = parse_questions(text)
+        total_blocks = len(questions) + len(warnings)
 
         if not questions:
             await status.edit_text(
-                "❌ Javobi aniqlangan test savollari topilmadi.\n\n"
-                "Prototype hozir quyidagi formatlarni yaxshi taniydi:\n"
+                "❌ Quizga tayyor savol topilmadi.\n\n"
+                "Qo‘llab-quvvatlanadigan asosiy formatlar:\n\n"
                 "1. Savol\nA) ...\nB) ...\nC) ...\nD) ...\nJavob: B\n\n"
-                "yoki fayl oxirida: Javoblar: 1-B 2-A 3-D ..."
+                "yoki:\n1. Savol\nA) ...\n+B) to‘g‘ri javob\nC) ...\nD) ...\n\n"
+                "Bot to‘g‘ri javobni taxmin qilmaydi."
             )
             return
 
@@ -941,38 +1271,46 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "active": None,
             "results": {},
             "controller_id": user_id,
+            "controller_name": user.full_name,
+            "owner_username": user.username,
+            "owner_full_name": user.full_name,
+            "host_last_activity": time.time(),
             "last_leaderboard_text": None,
+            "shuffle_questions": False,
+            "shuffle_options": False,
+            "parser_total_blocks": total_blocks,
         }
+
+        # Save first so the RAM session knows the persistent quiz id.
+        saved_note = ""
+        if db.is_enabled():
+            try:
+                save_result = await db.save_quiz(
+                    owner_id=user_id,
+                    username=user.username,
+                    full_name=user.full_name,
+                    filename=filename,
+                    questions=questions,
+                )
+                if save_result:
+                    session_data["saved_quiz_id"] = int(save_result["quiz_id"])
+                    if save_result.get("created_new"):
+                        saved_note = "\n💾 Yangi test bazaga saqlandi."
+                    else:
+                        saved_note = "\n💾 Saqlangan test yangilandi."
+            except Exception:
+                logging.exception("Could not save quiz to database")
+                saved_note = "\n⚠️ Test ishlaydi, lekin bazaga saqlashda xato bo‘ldi."
 
         if group_mode:
             GROUP_DATA[chat_id] = session_data
         else:
             USER_DATA[user_id] = session_data
 
-        saved_note = ""
-        if db.is_enabled():
-            try:
-                saved_id = await db.save_quiz(
-                    owner_id=user_id,
-                    username=update.effective_user.username,
-                    full_name=update.effective_user.full_name,
-                    filename=filename,
-                    questions=questions,
-                )
-                session_data["saved_quiz_id"] = saved_id
-                saved_note = "\n💾 Test doimiy bazaga saqlandi."
-            except Exception:
-                logging.exception("Could not save quiz to database")
-                saved_note = "\n⚠️ Test ishlaydi, lekin bazaga saqlashda xato bo‘ldi."
-
-        total_blocks = len(questions) + len(warnings)
-
         warning_text = ""
         if warnings:
             preview = "\n".join(f"• {w}" for w in warnings[:8])
-            more = ""
-            if len(warnings) > 8:
-                more = f"\n• ... yana {len(warnings) - 8} ta"
+            more = f"\n• ... yana {len(warnings) - 8} ta" if len(warnings) > 8 else ""
             warning_text = (
                 f"\n⚠️ Muammoli savollar: {len(warnings)}\n"
                 f"{preview}{more}"
@@ -981,8 +1319,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode_note = ""
         if group_mode:
             mode_note = (
-                f"\n👤 Boshqaruvchi: {update.effective_user.full_name}\n"
-                "Faqat shu foydalanuvchi quiz sozlamalarini boshqaradi."
+                f"\n👤 Boshqaruvchi: {user.full_name}\n"
+                "Faqat boshqaruvchi setup/START/skip/stop tugmalarini ishlata oladi."
             )
 
         await status.edit_text(
@@ -993,7 +1331,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{warning_text}"
             f"{mode_note}"
             f"{saved_note}\n\n"
-            f"Har bir guruhda nechta savol bo‘lsin?",
+            "Har bir bo‘limda nechta savol bo‘lsin?",
             reply_markup=group_size_keyboard(group_mode=group_mode),
         )
 
@@ -1009,7 +1347,6 @@ def build_groups(questions: List[dict], size: int) -> List[List[dict]]:
 async def choose_size_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user_id = update.effective_user.id
     session = USER_DATA.get(user_id)
     if not session:
@@ -1017,10 +1354,49 @@ async def choose_size_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     size = int(query.data.split(":")[1])
-    groups = build_groups(session["questions"], size)
     session["group_size"] = size
-    session["groups"] = groups
+    session.setdefault("shuffle_questions", False)
+    session.setdefault("shuffle_options", False)
+    await send_order_settings(query.message, session, group_mode=False)
 
+
+async def private_toggle_questions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = USER_DATA.get(update.effective_user.id)
+    if not session:
+        await query.answer("Sessiya topilmadi", show_alert=True)
+        return
+    session["shuffle_questions"] = not bool(session.get("shuffle_questions"))
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=order_settings_keyboard(session, group_mode=False)
+    )
+
+
+async def private_toggle_options_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = USER_DATA.get(update.effective_user.id)
+    if not session:
+        await query.answer("Sessiya topilmadi", show_alert=True)
+        return
+    session["shuffle_options"] = not bool(session.get("shuffle_options"))
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=order_settings_keyboard(session, group_mode=False)
+    )
+
+
+async def private_order_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    session = USER_DATA.get(user_id)
+    if not session or not session.get("group_size"):
+        await query.message.reply_text("❌ Avval guruh hajmini tanlang.")
+        return
+    ordered = apply_question_order(session)
+    session["ordered_questions"] = ordered
+    session["groups"] = build_groups(ordered, session["group_size"])
     await show_groups(query.message, user_id)
 
 
@@ -1040,10 +1416,14 @@ async def show_groups(message, user_id: int):
         if result:
             suffix = f" ✅ {result['percent']}%"
 
+        if session.get("shuffle_questions"):
+            label = f"📘 {idx + 1}-guruh · {len(group)} ta 🔀{suffix}"
+        else:
+            label = f"📘 {idx + 1}-guruh · {start_no}-{end_no}{suffix}"
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"📘 {idx + 1}-guruh · {start_no}-{end_no}{suffix}",
+                    label,
                     callback_data=f"group:{idx}",
                 )
             ]
@@ -1107,9 +1487,14 @@ async def group_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
 
+    range_text = (
+        "🔀 Aralashtirilgan savollar"
+        if session.get("shuffle_questions")
+        else f"Savollar: {start_no}-{end_no}"
+    )
     await query.message.reply_text(
         f"📘 {group_index + 1}-guruh\n"
-        f"Savollar: {start_no}-{end_no}\n"
+        f"{range_text}\n"
         f"Jami: {len(group)}"
         f"{previous_text}\n\n"
         "⏱ Har bir savol uchun vaqtni tanlang:",
@@ -1193,6 +1578,9 @@ async def start_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not session:
         await query.message.reply_text("❌ Sessiya topilmadi.")
         return
+    if session.get("active"):
+        await query.message.reply_text("⚠️ Quiz allaqachon ishlayapti.")
+        return
 
     parts = query.data.split(":")
     if len(parts) != 3:
@@ -1234,7 +1622,9 @@ async def start_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text(
         f"🚀 {group_index + 1}-guruh boshlandi!\n"
         f"Jami {len(session['active']['questions'])} ta savol.\n"
-        f"⏱ Har bir savol uchun: {format_duration(timer_seconds)}"
+        f"⏱ Har bir savol uchun: {format_duration(timer_seconds)}\n"
+        f"🔀 Savollar: {'ON' if session.get('shuffle_questions') else 'OFF'} · "
+        f"Variantlar: {'ON' if session.get('shuffle_options') else 'OFF'}"
     )
     await send_next_question(chat_id, user_id, context)
 
@@ -1264,7 +1654,11 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         return
 
     item = questions[idx]
-    options = [telegram_safe_option(x) for x in item["options"]]
+    displayed_options, displayed_correct_index = prepare_poll_options(
+        item,
+        bool(session.get("shuffle_options")),
+    )
+    options = [telegram_safe_option(x) for x in displayed_options]
     timer_seconds = active["timer_seconds"]
 
     try:
@@ -1275,7 +1669,7 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
             ),
             options=options,
             type="quiz",
-            correct_option_id=int(item["correct_index"]),
+            correct_option_id=displayed_correct_index,
             is_anonymous=False,
             allows_multiple_answers=False,
             open_period=timer_seconds,
@@ -1298,6 +1692,7 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         "group_index": active["group_index"],
         "question_index": idx,
         "run_id": active["run_id"],
+        "poll_correct_index": displayed_correct_index,
         "handled": False,
     }
 
@@ -1413,8 +1808,9 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     item = active["questions"][q_idx]
     selected = answer.option_ids[0] if answer.option_ids else None
+    correct_index = int(meta.get("poll_correct_index", item["correct_index"]))
 
-    if selected == int(item["correct_index"]):
+    if selected == correct_index:
         active["correct"] += 1
         active["current_streak"] = active.get("current_streak", 0) + 1
         active["best_streak"] = max(
@@ -1468,6 +1864,26 @@ async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             "best_streak": best_streak,
             "problem_questions": problem_questions,
         }
+
+    if db.is_enabled():
+        try:
+            await db.save_attempt(
+                user_id=user_id,
+                username=session.get("owner_username"),
+                full_name=session.get("owner_full_name"),
+                quiz_id=session.get("saved_quiz_id"),
+                mode="review" if active.get("review_mode") else "private",
+                chat_id=chat_id,
+                section_index=group_index,
+                total=total,
+                correct=correct,
+                wrong=wrong_answered,
+                unanswered=unanswered,
+                percent=percent,
+                best_streak=best_streak,
+            )
+        except Exception:
+            logging.exception("Could not save private attempt")
 
     buttons = [
         [
@@ -1553,13 +1969,61 @@ async def group_choose_size_callback(update: Update, context: ContextTypes.DEFAU
         await query.message.reply_text("❌ Guruh sessiyasi topilmadi. Testni qayta yuboring.")
         return
     if not group_controller_ok(update, session):
-        await query.answer("Bu testni faqat uni yuklagan foydalanuvchi boshqaradi.", show_alert=True)
+        await query.answer("Bu quizni faqat boshqaruvchi sozlaydi.", show_alert=True)
         return
     await query.answer()
 
     size = int(query.data.split(":")[1])
     session["group_size"] = size
-    session["groups"] = build_groups(session["questions"], size)
+    session.setdefault("shuffle_questions", False)
+    session.setdefault("shuffle_options", False)
+    touch_group_host(session)
+    await send_order_settings(query.message, session, group_mode=True)
+
+
+async def group_toggle_questions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = GROUP_DATA.get(update.effective_chat.id)
+    if not session or not group_controller_ok(update, session):
+        await query.answer("Faqat boshqaruvchi sozlaydi.", show_alert=True)
+        return
+    session["shuffle_questions"] = not bool(session.get("shuffle_questions"))
+    touch_group_host(session)
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=order_settings_keyboard(session, group_mode=True)
+    )
+
+
+async def group_toggle_options_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session = GROUP_DATA.get(update.effective_chat.id)
+    if not session or not group_controller_ok(update, session):
+        await query.answer("Faqat boshqaruvchi sozlaydi.", show_alert=True)
+        return
+    session["shuffle_options"] = not bool(session.get("shuffle_options"))
+    touch_group_host(session)
+    await query.answer()
+    await query.edit_message_reply_markup(
+        reply_markup=order_settings_keyboard(session, group_mode=True)
+    )
+
+
+async def group_order_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    session = GROUP_DATA.get(chat_id)
+    if not session or not group_controller_ok(update, session):
+        await query.answer("Faqat boshqaruvchi sozlaydi.", show_alert=True)
+        return
+    if not session.get("group_size"):
+        await query.answer("Avval bo‘lim hajmini tanlang.", show_alert=True)
+        return
+    ordered = apply_question_order(session)
+    session["ordered_questions"] = ordered
+    session["groups"] = build_groups(ordered, session["group_size"])
+    touch_group_host(session)
+    await query.answer()
     await show_group_quiz_groups(query.message, chat_id)
 
 
@@ -1573,10 +2037,14 @@ async def show_group_quiz_groups(message, chat_id: int):
     for idx, group in enumerate(session.get("groups", [])):
         start_no = idx * session["group_size"] + 1
         end_no = start_no + len(group) - 1
+        if session.get("shuffle_questions"):
+            label = f"📘 {idx + 1}-bo‘lim · {len(group)} ta 🔀"
+        else:
+            label = f"📘 {idx + 1}-bo‘lim · {start_no}-{end_no}"
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"📘 {idx + 1}-bo‘lim · {start_no}-{end_no}",
+                    label,
                     callback_data=f"ggroup:{idx}",
                 )
             ]
@@ -1634,9 +2102,15 @@ async def group_quiz_group_callback(update: Update, context: ContextTypes.DEFAUL
         ]
     )
 
+    touch_group_host(session)
+    range_text = (
+        "🔀 Aralashtirilgan savollar"
+        if session.get("shuffle_questions")
+        else f"Savollar: {start_no}-{end_no}"
+    )
     await query.message.reply_text(
         f"📘 {group_index + 1}-bo‘lim\n"
-        f"Savollar: {start_no}-{end_no}\n"
+        f"{range_text}\n"
         f"Jami: {len(group)}\n\n"
         "⏱ Har bir savol uchun vaqtni tanlang:",
         reply_markup=keyboard,
@@ -1666,6 +2140,7 @@ async def group_timer_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if group_index < 0 or group_index >= len(session.get("groups", [])):
         return
 
+    touch_group_host(session)
     group = session["groups"][group_index]
     max_seconds = len(group) * seconds
     max_time_text = (
@@ -1721,10 +2196,14 @@ async def group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer()
         await query.message.reply_text("❌ Guruh sessiyasi topilmadi.")
         return
+    if session.get("active"):
+        await query.answer("Quiz allaqachon ishlayapti.", show_alert=True)
+        return
     if not group_controller_ok(update, session):
         await query.answer("START ni faqat testni yuklagan foydalanuvchi bosishi mumkin.", show_alert=True)
         return
     await query.answer()
+    touch_group_host(session)
 
     _, group_text, seconds_text = query.data.split(":")
     group_index = int(group_text)
@@ -1760,7 +2239,9 @@ async def group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🚀 Guruh quizi boshlandi!\n"
         f"📘 {group_index + 1}-bo‘lim\n"
         f"❓ {len(session['active']['questions'])} ta savol\n"
-        f"⏱ {format_duration(timer_seconds)}/savol\n\n"
+        f"⏱ {format_duration(timer_seconds)}/savol\n"
+        f"🔀 Savollar: {'ON' if session.get('shuffle_questions') else 'OFF'} · "
+        f"Variantlar: {'ON' if session.get('shuffle_options') else 'OFF'}\n\n"
         "Javob bergan bo‘lsangiz ham, keyingi savol taymer tugagach chiqadi."
     )
 
@@ -1781,7 +2262,11 @@ async def send_next_group_question(chat_id: int, context: ContextTypes.DEFAULT_T
         return
 
     item = questions[idx]
-    options = [telegram_safe_option(x) for x in item["options"]]
+    displayed_options, displayed_correct_index = prepare_poll_options(
+        item,
+        bool(session.get("shuffle_options")),
+    )
+    options = [telegram_safe_option(x) for x in displayed_options]
     timer_seconds = active["timer_seconds"]
     active["answered_users"] = set()
 
@@ -1793,7 +2278,7 @@ async def send_next_group_question(chat_id: int, context: ContextTypes.DEFAULT_T
             ),
             options=options,
             type="quiz",
-            correct_option_id=int(item["correct_index"]),
+            correct_option_id=displayed_correct_index,
             is_anonymous=False,
             allows_multiple_answers=False,
             open_period=timer_seconds,
@@ -1818,6 +2303,7 @@ async def send_next_group_question(chat_id: int, context: ContextTypes.DEFAULT_T
         "group_index": active["group_index"],
         "question_index": idx,
         "run_id": active["run_id"],
+        "poll_correct_index": displayed_correct_index,
         "handled": False,
     }
 
@@ -1872,6 +2358,8 @@ async def group_poll_answer_handler(
         user.id,
         {
             "name": user.full_name or (f"@{user.username}" if user.username else str(user.id)),
+            "username": user.username,
+            "full_name": user.full_name,
             "correct": 0,
             "wrong": 0,
             "current_streak": 0,
@@ -1880,7 +2368,8 @@ async def group_poll_answer_handler(
     )
 
     item = active["questions"][meta["question_index"]]
-    if selected == int(item["correct_index"]):
+    correct_index = int(meta.get("poll_correct_index", item["correct_index"]))
+    if selected == correct_index:
         participant["correct"] += 1
         participant["current_streak"] += 1
         participant["best_streak"] = max(
@@ -1983,6 +2472,28 @@ async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, co
             }
         )
 
+    if db.is_enabled():
+        for row in ranking:
+            p = participants.get(row["user_id"], {})
+            try:
+                await db.save_attempt(
+                    user_id=row["user_id"],
+                    username=p.get("username"),
+                    full_name=p.get("full_name") or row.get("name"),
+                    quiz_id=session.get("saved_quiz_id"),
+                    mode="group",
+                    chat_id=chat_id,
+                    section_index=group_index,
+                    total=total,
+                    correct=row["correct"],
+                    wrong=row["wrong"],
+                    unanswered=row["unanswered"],
+                    percent=row["percent"],
+                    best_streak=row["best_streak"],
+                )
+            except Exception:
+                logging.exception("Could not save group attempt for %s", row["user_id"])
+
     ranking.sort(
         key=lambda x: (
             -x["correct"],
@@ -2021,6 +2532,7 @@ async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, co
     session["last_leaderboard_text"] = leaderboard_text
     session.setdefault("group_results", {})[group_index] = ranking
     session["active"] = None
+    touch_group_host(session)
 
     try:
         await context.bot.send_message(chat_id=chat_id, text="🎉")
@@ -2035,6 +2547,7 @@ async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, co
             )
         ],
         [InlineKeyboardButton("📚 Bo‘limlar", callback_data="ggroups")],
+        [InlineKeyboardButton("🔓 Sessiyani tugatish", callback_data="g_release")],
         [InlineKeyboardButton("🏠 Guruh menyusi", callback_data="g_home")],
     ]
 
@@ -2261,6 +2774,9 @@ def main():
     app.add_handler(CommandHandler("stop", stop_group_command))
     app.add_handler(CommandHandler("skip", skip_group_command))
     app.add_handler(CommandHandler("dbstatus", db_status_command))
+    app.add_handler(CommandHandler("parser", parser_command))
+    app.add_handler(CommandHandler("plan", plan_command))
+    app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(
         MessageHandler(
             filters.Document.PDF
@@ -2271,6 +2787,8 @@ def main():
 
     app.add_handler(CallbackQueryHandler(home_callback, pattern=r"^menu_home$"))
     app.add_handler(CallbackQueryHandler(group_home_callback, pattern=r"^g_home$"))
+    app.add_handler(CallbackQueryHandler(group_release_callback, pattern=r"^g_release$"))
+    app.add_handler(CallbackQueryHandler(group_parser_callback, pattern=r"^g_parser$"))
     app.add_handler(CallbackQueryHandler(group_saved_callback, pattern=r"^g_saved$"))
     app.add_handler(CallbackQueryHandler(private_load_saved_callback, pattern=r"^pload:\d+$"))
     app.add_handler(CallbackQueryHandler(group_load_saved_callback, pattern=r"^gload:\d+$"))
@@ -2289,7 +2807,13 @@ def main():
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^menu_help$"))
     app.add_handler(CallbackQueryHandler(help_upload_callback, pattern=r"^help_upload$"))
     app.add_handler(CallbackQueryHandler(choose_size_callback, pattern=r"^size:\d+$"))
+    app.add_handler(CallbackQueryHandler(private_toggle_questions_callback, pattern=r"^ptoq$"))
+    app.add_handler(CallbackQueryHandler(private_toggle_options_callback, pattern=r"^ptoa$"))
+    app.add_handler(CallbackQueryHandler(private_order_done_callback, pattern=r"^porderdone$"))
     app.add_handler(CallbackQueryHandler(group_choose_size_callback, pattern=r"^gsize:\d+$"))
+    app.add_handler(CallbackQueryHandler(group_toggle_questions_callback, pattern=r"^gtoq$"))
+    app.add_handler(CallbackQueryHandler(group_toggle_options_callback, pattern=r"^gtoa$"))
+    app.add_handler(CallbackQueryHandler(group_order_done_callback, pattern=r"^gorderdone$"))
     app.add_handler(CallbackQueryHandler(group_quiz_group_callback, pattern=r"^ggroup:\d+$"))
     app.add_handler(CallbackQueryHandler(group_groups_callback, pattern=r"^ggroups$"))
     app.add_handler(CallbackQueryHandler(group_timer_callback, pattern=r"^gtimer:\d+:(?:10|15|20|30|40|60|120)$"))
