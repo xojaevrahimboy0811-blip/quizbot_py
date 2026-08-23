@@ -12,7 +12,16 @@ from docx import Document
 from pypdf import PdfReader
 
 import database_quiz as db
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeChatMember,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -44,7 +53,80 @@ TIMER_CHOICES = [10, 15, 20, 30, 40, 60, 120]
 GROUP_EMPTY_STOP_THRESHOLD = 3
 GROUP_SETUP_TTL_SECONDS = 15 * 60
 FREE_IMPORT_LIMIT = 1
+
 OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or 0)
+
+PRIVATE_COMMAND_MENU = [
+    BotCommand("start", "Bosh menyuni ochish"),
+    BotCommand("new", "Yangi test yuklash"),
+    BotCommand("quizzes", "Saqlangan testlarim"),
+    BotCommand("continue", "Oxirgi quizni davom ettirish"),
+    BotCommand("progress", "Natijalarim"),
+    BotCommand("group", "Guruh quiz rejimi"),
+    BotCommand("settings", "Sozlamalar"),
+    BotCommand("plan", "Tarif holati"),
+    BotCommand("help", "Yordam"),
+]
+
+GROUP_COMMAND_MENU = [
+    BotCommand("start", "Guruh menyusini ochish"),
+    BotCommand("group", "Guruh quizini boshlash/boshqarish"),
+    BotCommand("quizzes", "Mening saqlangan testlarim"),
+    BotCommand("help", "Guruh quiz bo‘yicha yordam"),
+]
+
+GROUP_HOST_COMMAND_MENU = [
+    BotCommand("group", "Guruh quiz boshqaruv paneli"),
+    BotCommand("quizzes", "Mening saqlangan testlarim"),
+    BotCommand("new", "Yangi test yuklash"),
+    BotCommand("skip", "Joriy savolni o‘tkazib yuborish"),
+    BotCommand("stop", "Quizni natija bilan to‘xtatish"),
+    BotCommand("release", "Quiz boshqaruvini bo‘shatish"),
+    BotCommand("parser", "Joriy test parser hisobotini ko‘rish"),
+    BotCommand("help", "Yordam"),
+]
+
+
+async def set_host_command_menu(bot, chat_id: int, user_id: int) -> None:
+    """Show controller-only commands after '/' only to the current group host."""
+    try:
+        await bot.set_my_commands(
+            GROUP_HOST_COMMAND_MENU,
+            scope=BotCommandScopeChatMember(chat_id=chat_id, user_id=user_id),
+        )
+    except Exception:
+        logging.exception("Could not set host command menu")
+
+
+async def clear_host_command_menu(bot, chat_id: int, user_id: int) -> None:
+    """Remove the host-specific menu so Telegram falls back to normal group commands."""
+    try:
+        await bot.delete_my_commands(
+            scope=BotCommandScopeChatMember(chat_id=chat_id, user_id=user_id),
+        )
+    except Exception:
+        logging.exception("Could not clear host command menu")
+
+
+async def claim_group_host_with_menu(chat_id: int, user, bot) -> Tuple[bool, Optional[str]]:
+    """
+    Claim the group host lock and immediately give that user the controller command menu.
+    If an old setup lock went stale, also clear its stale command menu.
+    """
+    previous = GROUP_DATA.get(chat_id)
+    stale_previous_id = None
+    if previous and host_is_stale(previous):
+        stale_previous_id = previous.get("controller_id")
+
+    ok, host_name = await claim_group_host_with_menu(chat_id, user, context.bot)
+    if not ok:
+        return ok, host_name
+
+    if stale_previous_id and stale_previous_id != user.id:
+        await clear_host_command_menu(bot, chat_id, int(stale_previous_id))
+
+    await set_host_command_menu(bot, chat_id, user.id)
+    return True, None
 
 
 def format_duration(seconds: int) -> str:
@@ -595,7 +677,7 @@ async def send_new_quiz_prompt(message):
 
 async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update.effective_chat):
-        ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+        ok, host_name = await claim_group_host_with_menu(update.effective_chat.id, update.effective_user, context.bot)
         if not ok:
             await update.message.reply_text(
                 f"🔒 Hozir {host_name} guruh quizini boshqaryapti."
@@ -692,7 +774,7 @@ async def show_saved_quizzes(message, tg_user, group_mode: bool = False):
 async def quizzes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_mode = is_group_chat(update.effective_chat)
     if group_mode:
-        ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+        ok, host_name = await claim_group_host_with_menu(update.effective_chat.id, update.effective_user, context.bot)
         if not ok:
             await update.message.reply_text(
                 f"🔒 Hozir {host_name} guruh quizini boshqaryapti."
@@ -713,7 +795,7 @@ async def quizzes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def group_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+    ok, host_name = await claim_group_host_with_menu(update.effective_chat.id, update.effective_user, context.bot)
     if not ok:
         await query.answer(f"Hozir {host_name} boshqaryapti.", show_alert=True)
         return
@@ -762,7 +844,7 @@ async def private_load_saved_callback(update: Update, context: ContextTypes.DEFA
 async def group_load_saved_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = update.effective_chat.id
-    ok, host_name = claim_group_host(chat_id, update.effective_user)
+    ok, host_name = await claim_group_host_with_menu(chat_id, update.effective_user, context.bot)
     if not ok:
         await query.answer(
             f"Bu guruh quizini hozir {host_name} boshqaryapti.",
@@ -934,7 +1016,7 @@ async def send_group_mode_info(message, context: ContextTypes.DEFAULT_TYPE):
 
 async def group_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group_chat(update.effective_chat):
-        ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+        ok, host_name = await claim_group_host_with_menu(update.effective_chat.id, update.effective_user, context.bot)
         if not ok:
             await update.message.reply_text(
                 f"🔒 Bu guruh quizini hozir {host_name} boshqaryapti. "
@@ -963,7 +1045,7 @@ async def group_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def group_new_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    ok, host_name = claim_group_host(update.effective_chat.id, update.effective_user)
+    ok, host_name = await claim_group_host_with_menu(update.effective_chat.id, update.effective_user, context.bot)
     if not ok:
         await query.answer(f"Hozir {host_name} boshqaryapti.", show_alert=True)
         return
@@ -1165,6 +1247,34 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Sizning Telegram ID: {update.effective_user.id}")
 
 
+async def release_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_group_chat(update.effective_chat):
+        await update.message.reply_text("/release faqat guruhda ishlaydi.")
+        return
+
+    chat_id = update.effective_chat.id
+    session = GROUP_DATA.get(chat_id)
+    if not session:
+        await update.message.reply_text("🔓 Hozir guruh quiz boshqaruvchisi yo‘q.")
+        return
+
+    if update.effective_user.id != session.get("controller_id"):
+        await update.message.reply_text("⛔ Boshqaruvni faqat joriy quiz egasi bo‘shata oladi.")
+        return
+
+    if session.get("active"):
+        await update.message.reply_text("⚠️ Avval /stop bilan faol quizni to‘xtating.")
+        return
+
+    old_host_id = int(session["controller_id"])
+    GROUP_DATA.pop(chat_id, None)
+    await clear_host_command_menu(context.bot, chat_id, old_host_id)
+    await update.message.reply_text(
+        "🔓 Guruh quiz boshqaruvi bo‘shatildi.\n"
+        "Endi boshqa foydalanuvchi /group orqali quiz boshlashi mumkin."
+    )
+
+
 async def group_release_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     session = GROUP_DATA.get(update.effective_chat.id)
@@ -1178,7 +1288,10 @@ async def group_release_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Avval /stop bilan faol quizni to‘xtating.", show_alert=True)
         return
     await query.answer()
-    GROUP_DATA.pop(update.effective_chat.id, None)
+    chat_id = update.effective_chat.id
+    old_host_id = int(session["controller_id"])
+    GROUP_DATA.pop(chat_id, None)
+    await clear_host_command_menu(context.bot, chat_id, old_host_id)
     await query.message.reply_text("🔓 Guruh quiz boshqaruvi bo‘shatildi. Endi boshqa foydalanuvchi boshlashi mumkin.")
 
 
@@ -1199,7 +1312,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # In groups, an upload is part of the host's setup. Do not let a second user
     # overwrite another person's quiz session.
     if group_mode:
-        ok, host_name = claim_group_host(chat_id, user)
+        ok, host_name = await claim_group_host_with_menu(chat_id, user, context.bot)
         if not ok:
             await update.message.reply_text(
                 f"🔒 Bu guruh quizini hozir {host_name} boshqaryapti. "
@@ -2685,6 +2798,23 @@ async def db_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def app_post_init(application: Application):
     try:
+        await application.bot.set_my_commands(
+            PRIVATE_COMMAND_MENU,
+            scope=BotCommandScopeDefault(),
+        )
+        await application.bot.set_my_commands(
+            PRIVATE_COMMAND_MENU,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        await application.bot.set_my_commands(
+            GROUP_COMMAND_MENU,
+            scope=BotCommandScopeAllGroupChats(),
+        )
+        logging.info("Telegram command menus configured.")
+    except Exception:
+        logging.exception("Could not configure Telegram command menus")
+
+    try:
         await db.init_pool()
     except Exception:
         logging.exception("Database initialization failed")
@@ -2773,6 +2903,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stop", stop_group_command))
     app.add_handler(CommandHandler("skip", skip_group_command))
+    app.add_handler(CommandHandler("release", release_group_command))
     app.add_handler(CommandHandler("dbstatus", db_status_command))
     app.add_handler(CommandHandler("parser", parser_command))
     app.add_handler(CommandHandler("plan", plan_command))
