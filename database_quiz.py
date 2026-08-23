@@ -71,6 +71,14 @@ async def init_pool() -> bool:
                 PRIMARY KEY (user_id, month_start)
             );
 
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
+                shuffle_questions BOOLEAN NOT NULL DEFAULT FALSE,
+                shuffle_options BOOLEAN NOT NULL DEFAULT FALSE,
+                quiz_mode TEXT NOT NULL DEFAULT 'practice',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
             CREATE TABLE IF NOT EXISTS attempts (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -429,5 +437,116 @@ async def list_recent_attempts(user_id: int, limit: int = 10) -> List[Dict[str, 
             """,
             user_id,
             limit,
+        )
+    return [dict(r) for r in rows]
+
+
+DEFAULT_PREFERENCES = {
+    "shuffle_questions": False,
+    "shuffle_options": False,
+    "quiz_mode": "practice",
+}
+
+
+async def get_user_preferences(user_id: int) -> Dict[str, Any]:
+    if not _POOL:
+        return dict(DEFAULT_PREFERENCES)
+    async with _POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT shuffle_questions, shuffle_options, quiz_mode
+            FROM user_preferences
+            WHERE user_id=$1
+            """,
+            user_id,
+        )
+    if not row:
+        return dict(DEFAULT_PREFERENCES)
+    result = dict(DEFAULT_PREFERENCES)
+    result.update(dict(row))
+    if result.get("quiz_mode") not in ("practice", "exam"):
+        result["quiz_mode"] = "practice"
+    return result
+
+
+async def update_user_preferences(
+    user_id: int,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None,
+    **changes,
+) -> Dict[str, Any]:
+    if not _POOL:
+        result = dict(DEFAULT_PREFERENCES)
+        result.update(changes)
+        return result
+
+    await ensure_user(user_id, username, full_name)
+    current = await get_user_preferences(user_id)
+    current.update(changes)
+    mode = current.get("quiz_mode", "practice")
+    if mode not in ("practice", "exam"):
+        mode = "practice"
+
+    async with _POOL.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_preferences
+                (user_id, shuffle_questions, shuffle_options, quiz_mode)
+            VALUES ($1,$2,$3,$4)
+            ON CONFLICT (user_id) DO UPDATE SET
+                shuffle_questions=EXCLUDED.shuffle_questions,
+                shuffle_options=EXCLUDED.shuffle_options,
+                quiz_mode=EXCLUDED.quiz_mode,
+                updated_at=NOW()
+            """,
+            user_id,
+            bool(current.get("shuffle_questions", False)),
+            bool(current.get("shuffle_options", False)),
+            mode,
+        )
+    return {
+        "shuffle_questions": bool(current.get("shuffle_questions", False)),
+        "shuffle_options": bool(current.get("shuffle_options", False)),
+        "quiz_mode": mode,
+    }
+
+
+async def rename_quiz(owner_id: int, quiz_id: int, new_name: str) -> bool:
+    if not _POOL:
+        return False
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return False
+    async with _POOL.acquire() as conn:
+        status = await conn.execute(
+            """
+            UPDATE quizzes SET name=$1, updated_at=NOW()
+            WHERE id=$2 AND owner_id=$3
+            """,
+            new_name[:120], quiz_id, owner_id,
+        )
+    return status.endswith("1")
+
+
+async def list_quiz_attempts(owner_id: int, quiz_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    if not _POOL:
+        return []
+    async with _POOL.acquire() as conn:
+        allowed = await conn.fetchval(
+            "SELECT 1 FROM quizzes WHERE id=$1 AND owner_id=$2",
+            quiz_id, owner_id,
+        )
+        if not allowed:
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT id, mode, section_index, total, correct, wrong,
+                   unanswered, percent, best_streak, created_at
+            FROM attempts
+            WHERE user_id=$1 AND quiz_id=$2
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            owner_id, quiz_id, limit,
         )
     return [dict(r) for r in rows]
