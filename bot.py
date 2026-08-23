@@ -61,6 +61,9 @@ PRIVATE_COMMAND_MENU = [
     BotCommand("new", "Yangi test yuklash"),
     BotCommand("quizzes", "Saqlangan testlarim"),
     BotCommand("continue", "Oxirgi quizni davom ettirish"),
+    BotCommand("pause", "Faol quizni vaqtincha pauza qilish"),
+    BotCommand("resume", "Pauzadagi quizni davom ettirish"),
+    BotCommand("stop", "Faol quizni to‘liq to‘xtatish"),
     BotCommand("progress", "Natijalarim"),
     BotCommand("group", "Guruh quiz rejimi"),
     BotCommand("settings", "Sozlamalar"),
@@ -79,8 +82,10 @@ GROUP_HOST_COMMAND_MENU = [
     BotCommand("group", "Guruh quiz boshqaruv paneli"),
     BotCommand("quizzes", "Mening saqlangan testlarim"),
     BotCommand("new", "Yangi test yuklash"),
+    BotCommand("pause", "Guruh quizini vaqtincha pauza qilish"),
+    BotCommand("resume", "Pauzadagi quizni davom ettirish"),
     BotCommand("skip", "Joriy savolni o‘tkazib yuborish"),
-    BotCommand("stop", "Quizni natija bilan to‘xtatish"),
+    BotCommand("stop", "Quizni to‘liq to‘xtatish"),
     BotCommand("release", "Quiz boshqaruvini bo‘shatish"),
     BotCommand("parser", "Joriy test parser hisobotini ko‘rish"),
     BotCommand("help", "Yordam"),
@@ -118,7 +123,7 @@ async def claim_group_host_with_menu(chat_id: int, user, bot) -> Tuple[bool, Opt
     if previous and host_is_stale(previous):
         stale_previous_id = previous.get("controller_id")
 
-    ok, host_name = await claim_group_host_with_menu(chat_id, user, context.bot)
+    ok, host_name = claim_group_host(chat_id, user)
     if not ok:
         return ok, host_name
 
@@ -907,13 +912,22 @@ async def show_continue(message, user_id: int):
 
     if session.get("active"):
         active = session["active"]
-        await message.reply_text(
-            f"▶️ Quiz hozir davom etmoqda.\n\n"
-            f"Guruh: {active['group_index'] + 1}\n"
-            f"Savol: {active['current'] + 1}/{len(active['questions'])}\n\n"
-            "Joriy Telegram polliga javob bering yoki vaqt tugashini kuting.",
-            reply_markup=home_button(),
-        )
+        if active.get("paused"):
+            await message.reply_text(
+                f"⏸ Quiz pauzada.\n\n"
+                f"Guruh: {active['group_index'] + 1}\n"
+                f"Keyingi savol: {active['current'] + 1}/{len(active['questions'])}\n\n"
+                "Davom ettirish uchun /resume yuboring.",
+                reply_markup=home_button(),
+            )
+        else:
+            await message.reply_text(
+                f"▶️ Quiz hozir davom etmoqda.\n\n"
+                f"Guruh: {active['group_index'] + 1}\n"
+                f"Savol: {active['current'] + 1}/{len(active['questions'])}\n\n"
+                "Joriy Telegram polliga javob bering yoki vaqt tugashini kuting.",
+                reply_markup=home_button(),
+            )
         return
 
     if session.get("groups"):
@@ -1114,7 +1128,9 @@ async def group_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         "5) ▶️ START ni bosing.\n\n"
         "Savol vaqt tugaguncha ochiq turadi. Hamma shu vaqt ichida javob beradi. "
         "Keyingi savol avtomatik ravishda vaqt tugagach chiqadi.\n\n"
-        "🛑 /stop — quizni natija bilan tugatish\n"
+        "⏸ /pause — quizni vaqtincha to‘xtatish\n"
+        "▶️ /resume — pauzadagi quizni davom ettirish\n"
+        "🛑 /stop — quizni butunlay tugatish\n"
         "⏭ /skip — joriy savolni o‘tkazish\n"
         f"😴 {GROUP_EMPTY_STOP_THRESHOLD} ta ketma-ket savolga hech kim javob bermasa, bot o‘zi to‘xtaydi.",
         reply_markup=group_home_keyboard(),
@@ -1161,7 +1177,7 @@ async def send_help(message):
         "• xatolarni qayta mashq qilish\n"
         "• natijalar tarixi\n"
         "• guruh quiz va reyting\n\n"
-        "Buyruqlar: /start /new /quizzes /continue /progress /group /stop /skip /parser /plan /help",
+        "Buyruqlar: /start /new /quizzes /continue /pause /resume /stop /progress /group /skip /parser /plan /help",
         reply_markup=home_button(),
     )
 
@@ -1725,6 +1741,10 @@ async def start_group_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "current_streak": 0,
         "best_streak": 0,
         "review_mode": False,
+        "empty_streak": 0,
+        "paused": False,
+        "current_poll_id": None,
+        "current_poll_message_id": None,
     }
 
     try:
@@ -1759,6 +1779,10 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         return
 
     active = session["active"]
+
+    if active.get("paused"):
+        return
+
     idx = active["current"]
     questions = active["questions"]
 
@@ -1797,6 +1821,9 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         active["current"] += 1
         await send_next_question(chat_id, user_id, context)
         return
+
+    active["current_poll_id"] = msg.poll.id
+    active["current_poll_message_id"] = msg.message_id
 
     POLL_MAP[msg.poll.id] = {
         "mode": "private",
@@ -1863,8 +1890,23 @@ async def question_timeout(
     meta["handled"] = True
     active["unanswered"].append(question_index)
     active["current_streak"] = 0
+    active["empty_streak"] = active.get("empty_streak", 0) + 1
     active["current"] += 1
+    active["current_poll_id"] = None
+    active["current_poll_message_id"] = None
     POLL_MAP.pop(poll_id, None)
+
+    if active["empty_streak"] >= 3:
+        active["paused"] = True
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏸ Quiz avtomatik pauzaga qo‘yildi.\n\n"
+                "Oxirgi 3 ta savol javobsiz qoldi. "
+                "Davom ettirish uchun /resume yuboring yoki butunlay tugatish uchun /stop yuboring."
+            ),
+        )
+        return
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -1940,17 +1982,21 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         active["wrong"].append(q_idx)
         active["current_streak"] = 0
 
+    # Any submitted answer means the user is active again.
+    active["empty_streak"] = 0
     active["current"] += 1
+    active["current_poll_id"] = None
+    active["current_poll_message_id"] = None
     POLL_MAP.pop(answer.poll_id, None)
 
     await send_next_question(meta["chat_id"], user_id, context)
 
 
-async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, completed_count: Optional[int] = None, stopped_reason: Optional[str] = None):
     session = USER_DATA[user_id]
     active = session["active"]
 
-    total = len(active["questions"])
+    total = completed_count if completed_count is not None else len(active["questions"])
     correct = active["correct"]
     wrong_answered = len(active["wrong"])
     unanswered = len(active["unanswered"])
@@ -1966,6 +2012,16 @@ async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
         if 0 <= i < len(active["questions"])
     ]
 
+    # If a review was manually stopped early, questions not reached yet are
+    # still unresolved and must remain in the next review round.
+    if active.get("review_mode") and completed_count is not None:
+        unresolved_tail = active["questions"][completed_count:]
+        seen_ids = {id(q) for q in problem_questions}
+        for q in unresolved_tail:
+            if id(q) not in seen_ids:
+                problem_questions.append(q)
+                seen_ids.add(id(q))
+
     if not active.get("review_mode"):
         session["results"][group_index] = {
             "correct": correct,
@@ -1977,6 +2033,12 @@ async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
             "best_streak": best_streak,
             "problem_questions": problem_questions,
         }
+    else:
+        # Review mode is progressive: only mistakes from THIS review survive.
+        # Corrected questions disappear from the next review round.
+        previous_result = session["results"].setdefault(group_index, {})
+        previous_result["problem_questions"] = problem_questions
+        previous_result["review_remaining"] = len(problem_questions)
 
     if db.is_enabled():
         try:
@@ -2050,7 +2112,10 @@ async def finish_group(chat_id: int, user_id: int, context: ContextTypes.DEFAULT
         except Exception:
             pass
 
-    title = "🏁 Xatolar mashqi tugadi!" if was_review else f"🏁 {group_index + 1}-guruh tugadi!"
+    if stopped_reason == "manual":
+        title = "🛑 Quiz to‘xtatildi"
+    else:
+        title = "🏁 Xatolar mashqi tugadi!" if was_review else f"🏁 {group_index + 1}-guruh tugadi!"
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -2339,6 +2404,8 @@ async def group_start_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "participants": {},
         "answered_users": set(),
         "empty_streak": 0,
+        "paused": False,
+        "current_answers": {},
         "current_poll_id": None,
         "current_poll_message_id": None,
     }
@@ -2367,6 +2434,10 @@ async def send_next_group_question(chat_id: int, context: ContextTypes.DEFAULT_T
         return
 
     active = session["active"]
+
+    if active.get("paused"):
+        return
+
     idx = active["current"]
     questions = active["questions"]
 
@@ -2382,6 +2453,7 @@ async def send_next_group_question(chat_id: int, context: ContextTypes.DEFAULT_T
     options = [telegram_safe_option(x) for x in displayed_options]
     timer_seconds = active["timer_seconds"]
     active["answered_users"] = set()
+    active["current_answers"] = {}
 
     try:
         msg = await context.bot.send_poll(
@@ -2451,6 +2523,7 @@ async def group_poll_answer_handler(
         or active.get("group_index") != meta.get("group_index")
         or active.get("current") != meta.get("question_index")
         or meta.get("handled")
+        or active.get("paused")
     ):
         return
 
@@ -2458,7 +2531,6 @@ async def group_poll_answer_handler(
     if not user or user.is_bot:
         return
 
-    # Count only the first submitted answer for this question.
     if user.id in active["answered_users"]:
         return
 
@@ -2467,34 +2539,50 @@ async def group_poll_answer_handler(
         return
 
     active["answered_users"].add(user.id)
-    participant = active["participants"].setdefault(
-        user.id,
-        {
-            "name": user.full_name or (f"@{user.username}" if user.username else str(user.id)),
-            "username": user.username,
-            "full_name": user.full_name,
-            "correct": 0,
-            "wrong": 0,
-            "current_streak": 0,
-            "best_streak": 0,
-        },
-    )
-
     item = active["questions"][meta["question_index"]]
     correct_index = int(meta.get("poll_correct_index", item["correct_index"]))
-    if selected == correct_index:
-        participant["correct"] += 1
-        participant["current_streak"] += 1
-        participant["best_streak"] = max(
-            participant["best_streak"],
-            participant["current_streak"],
-        )
-    else:
-        participant["wrong"] += 1
-        participant["current_streak"] = 0
 
-    # IMPORTANT: do NOT send the next question here.
-    # Everyone waits until group_question_timeout() fires.
+    # Do not commit group scores until the question timer finishes.
+    # This lets /pause safely restart the current question without double-counting.
+    active["current_answers"][user.id] = {
+        "name": user.full_name or (f"@{user.username}" if user.username else str(user.id)),
+        "username": user.username,
+        "full_name": user.full_name,
+        "is_correct": selected == correct_index,
+    }
+
+
+def commit_group_current_answers(active: dict) -> int:
+    answers = active.get("current_answers", {})
+    for user_id, answer_data in answers.items():
+        participant = active["participants"].setdefault(
+            user_id,
+            {
+                "name": answer_data.get("name") or str(user_id),
+                "username": answer_data.get("username"),
+                "full_name": answer_data.get("full_name"),
+                "correct": 0,
+                "wrong": 0,
+                "current_streak": 0,
+                "best_streak": 0,
+            },
+        )
+
+        if answer_data.get("is_correct"):
+            participant["correct"] += 1
+            participant["current_streak"] += 1
+            participant["best_streak"] = max(
+                participant["best_streak"],
+                participant["current_streak"],
+            )
+        else:
+            participant["wrong"] += 1
+            participant["current_streak"] = 0
+
+    count = len(answers)
+    active["current_answers"] = {}
+    active["answered_users"] = set()
+    return count
 
 
 async def group_question_timeout(
@@ -2528,7 +2616,7 @@ async def group_question_timeout(
 
     meta["handled"] = True
 
-    answered_count = len(active.get("answered_users", set()))
+    answered_count = commit_group_current_answers(active)
     if answered_count == 0:
         active["empty_streak"] = active.get("empty_streak", 0) + 1
     else:
@@ -2683,11 +2771,45 @@ async def finish_group_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, co
 
 
 async def stop_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop the active quiz completely in private chat or group."""
+    chat_id = update.effective_chat.id
+
     if not is_group_chat(update.effective_chat):
-        await update.message.reply_text("/stop faqat guruh quizida ishlaydi.")
+        user_id = update.effective_user.id
+        session = USER_DATA.get(user_id)
+        if not session or not session.get("active"):
+            await update.message.reply_text("🛑 Hozir faol quiz yo‘q.")
+            return
+
+        active = session["active"]
+        poll_id = active.get("current_poll_id")
+        message_id = active.get("current_poll_message_id")
+
+        if poll_id:
+            meta = POLL_MAP.get(poll_id)
+            if meta:
+                meta["handled"] = True
+            POLL_MAP.pop(poll_id, None)
+
+        if message_id:
+            try:
+                await context.bot.stop_poll(chat_id, message_id)
+            except Exception:
+                pass
+
+        active["current_poll_id"] = None
+        active["current_poll_message_id"] = None
+        completed = min(active["current"], len(active["questions"]))
+        await finish_group(
+            chat_id,
+            user_id,
+            context,
+            completed_count=completed,
+            stopped_reason="manual",
+        )
         return
 
-    session = GROUP_DATA.get(update.effective_chat.id)
+    session = GROUP_DATA.get(chat_id)
     if not session or not session.get("active"):
         await update.message.reply_text("🛑 Hozir faol guruh quizi yo‘q.")
         return
@@ -2695,15 +2817,153 @@ async def stop_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⛔ Quizni faqat uni boshlagan boshqaruvchi to‘xtata oladi.")
         return
 
-    await update.message.reply_text(
-        "⚠️ Quizni hozir to‘xtatamizmi? Hozirgacha bo‘lgan natija saqlanadi.",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🛑 Ha, to‘xtat", callback_data="gstop_yes")],
-                [InlineKeyboardButton("← Bekor qilish", callback_data="gstop_no")],
-            ]
-        ),
+    active = session["active"]
+    poll_id = active.get("current_poll_id")
+    message_id = active.get("current_poll_message_id")
+
+    if poll_id:
+        meta = POLL_MAP.get(poll_id)
+        if meta:
+            meta["handled"] = True
+        POLL_MAP.pop(poll_id, None)
+
+    if message_id:
+        try:
+            await context.bot.stop_poll(chat_id, message_id)
+        except Exception:
+            pass
+
+    # Keep answers already submitted on the visible question before stopping.
+    commit_group_current_answers(active)
+    completed = min(active["current"] + (1 if message_id else 0), len(active["questions"]))
+    active["current_poll_id"] = None
+    active["current_poll_message_id"] = None
+
+    await finish_group_quiz(
+        chat_id,
+        context,
+        completed_count=completed,
+        stopped_reason="manual",
     )
+
+
+async def pause_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Temporarily pause the current quiz. /resume continues it."""
+    chat_id = update.effective_chat.id
+
+    if not is_group_chat(update.effective_chat):
+        user_id = update.effective_user.id
+        session = USER_DATA.get(user_id)
+        if not session or not session.get("active"):
+            await update.message.reply_text("⏸ Hozir faol quiz yo‘q.")
+            return
+
+        active = session["active"]
+        if active.get("paused"):
+            await update.message.reply_text("⏸ Quiz allaqachon pauzada. /resume bilan davom eting.")
+            return
+
+        poll_id = active.get("current_poll_id")
+        message_id = active.get("current_poll_message_id")
+        if poll_id:
+            meta = POLL_MAP.get(poll_id)
+            if meta:
+                meta["handled"] = True
+            POLL_MAP.pop(poll_id, None)
+        if message_id:
+            try:
+                await context.bot.stop_poll(chat_id, message_id)
+            except Exception:
+                pass
+
+        # The interrupted question is not counted; it will be sent again on resume.
+        active["current_poll_id"] = None
+        active["current_poll_message_id"] = None
+        active["paused"] = True
+        await update.message.reply_text(
+            "⏸ Quiz pauzaga qo‘yildi. Joriy savol hisoblanmadi.\n"
+            "Davom ettirish uchun /resume yuboring."
+        )
+        return
+
+    session = GROUP_DATA.get(chat_id)
+    if not session or not session.get("active"):
+        await update.message.reply_text("⏸ Hozir faol guruh quizi yo‘q.")
+        return
+    if update.effective_user.id != session.get("controller_id"):
+        await update.message.reply_text("⛔ Quizni faqat boshqaruvchi pauza qila oladi.")
+        return
+
+    active = session["active"]
+    if active.get("paused"):
+        await update.message.reply_text("⏸ Guruh quizi allaqachon pauzada.")
+        return
+
+    poll_id = active.get("current_poll_id")
+    message_id = active.get("current_poll_message_id")
+    if poll_id:
+        meta = POLL_MAP.get(poll_id)
+        if meta:
+            meta["handled"] = True
+        POLL_MAP.pop(poll_id, None)
+    if message_id:
+        try:
+            await context.bot.stop_poll(chat_id, message_id)
+        except Exception:
+            pass
+
+    # Answers on an interrupted group question are discarded so nobody is double-counted.
+    active["current_answers"] = {}
+    active["answered_users"] = set()
+    active["current_poll_id"] = None
+    active["current_poll_message_id"] = None
+    active["paused"] = True
+    await update.message.reply_text(
+        "⏸ Guruh quizi pauzaga qo‘yildi. Joriy savol hisoblanmadi.\n"
+        "Davom ettirish uchun /resume yuboring."
+    )
+
+
+async def resume_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resume a manually/automatically paused quiz."""
+    chat_id = update.effective_chat.id
+
+    if not is_group_chat(update.effective_chat):
+        user_id = update.effective_user.id
+        session = USER_DATA.get(user_id)
+        if not session or not session.get("active"):
+            await update.message.reply_text("▶️ Davom ettiriladigan quiz topilmadi.")
+            return
+
+        active = session["active"]
+        if not active.get("paused"):
+            await update.message.reply_text("▶️ Quiz pauzada emas.")
+            return
+
+        active["paused"] = False
+        active["empty_streak"] = 0
+        await update.message.reply_text("▶️ Quiz davom etmoqda.")
+        await send_next_question(chat_id, user_id, context)
+        return
+
+    session = GROUP_DATA.get(chat_id)
+    if not session or not session.get("active"):
+        await update.message.reply_text("▶️ Davom ettiriladigan guruh quizi topilmadi.")
+        return
+    if update.effective_user.id != session.get("controller_id"):
+        await update.message.reply_text("⛔ Quizni faqat boshqaruvchi davom ettira oladi.")
+        return
+
+    active = session["active"]
+    if not active.get("paused"):
+        await update.message.reply_text("▶️ Guruh quizi pauzada emas.")
+        return
+
+    active["paused"] = False
+    active["empty_streak"] = 0
+    touch_group_host(session)
+    await update.message.reply_text("▶️ Guruh quizi davom etmoqda.")
+    await send_next_group_question(chat_id, context)
 
 
 async def group_stop_no_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2739,6 +2999,8 @@ async def group_stop_yes_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
 
+    # Keep submitted answers on the visible question before stopping.
+    commit_group_current_answers(active)
     # The currently visible question counts as seen.
     completed = min(active["current"] + (1 if message_id else 0), len(active["questions"]))
     active["current_poll_id"] = None
@@ -2782,6 +3044,8 @@ async def skip_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
 
+    active["current_answers"] = {}
+    active["answered_users"] = set()
     active["current"] += 1
     active["empty_streak"] = 0
     active["current_poll_id"] = None
@@ -2850,6 +3114,24 @@ async def retry_wrong_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("✅ Mashq qilish uchun xato savollar qolmagan.")
         return
 
+    # Remove the used "practice mistakes" button from the old result card.
+    # The new review result will show a fresh button only for mistakes that remain.
+    try:
+        if query.message.reply_markup:
+            cleaned_rows = []
+            for row in query.message.reply_markup.inline_keyboard:
+                kept = [
+                    button for button in row
+                    if not (button.callback_data or "").startswith("retrywrong:")
+                ]
+                if kept:
+                    cleaned_rows.append(kept)
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(cleaned_rows) if cleaned_rows else None
+            )
+    except Exception:
+        logging.exception("Could not remove stale retry button")
+
     session["run_counter"] = session.get("run_counter", 0) + 1
     run_id = session["run_counter"]
 
@@ -2866,6 +3148,10 @@ async def retry_wrong_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         "current_streak": 0,
         "best_streak": 0,
         "review_mode": True,
+        "empty_streak": 0,
+        "paused": False,
+        "current_poll_id": None,
+        "current_poll_message_id": None,
     }
 
     try:
@@ -2901,6 +3187,8 @@ def main():
     app.add_handler(CommandHandler("group", group_mode_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("pause", pause_quiz_command))
+    app.add_handler(CommandHandler("resume", resume_quiz_command))
     app.add_handler(CommandHandler("stop", stop_group_command))
     app.add_handler(CommandHandler("skip", skip_group_command))
     app.add_handler(CommandHandler("release", release_group_command))
