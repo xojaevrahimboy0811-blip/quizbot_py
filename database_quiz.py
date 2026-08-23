@@ -79,6 +79,15 @@ async def init_pool() -> bool:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS ai_monthly_usage (
+                user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+                month_start DATE NOT NULL,
+                import_count INTEGER NOT NULL DEFAULT 0,
+                recovered_questions INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, month_start)
+            );
+
             CREATE TABLE IF NOT EXISTS attempts (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -550,3 +559,101 @@ async def list_quiz_attempts(owner_id: int, quiz_id: int, limit: int = 10) -> Li
             owner_id, quiz_id, limit,
         )
     return [dict(r) for r in rows]
+async def get_ai_usage(user_id: int) -> Dict[str, int]:
+    if not _POOL:
+        return {"imports_used": 0, "recovered_questions": 0}
+
+    async with _POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT import_count, recovered_questions
+            FROM ai_monthly_usage
+            WHERE user_id=$1
+              AND month_start=date_trunc('month', CURRENT_DATE)::date
+            """,
+            user_id,
+        )
+
+    if not row:
+        return {"imports_used": 0, "recovered_questions": 0}
+    return {
+        "imports_used": int(row["import_count"] or 0),
+        "recovered_questions": int(row["recovered_questions"] or 0),
+    }
+
+
+async def can_use_ai_import(user_id: int, monthly_limit: int) -> Tuple[bool, Dict[str, int]]:
+    usage = await get_ai_usage(user_id)
+    return usage["imports_used"] < monthly_limit, usage
+
+
+async def record_ai_import(user_id: int, recovered_questions: int) -> None:
+    if not _POOL:
+        return
+
+    async with _POOL.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO ai_monthly_usage
+                (user_id, month_start, import_count, recovered_questions)
+            VALUES (
+                $1,
+                date_trunc('month', CURRENT_DATE)::date,
+                1,
+                $2
+            )
+            ON CONFLICT (user_id, month_start) DO UPDATE SET
+                import_count = ai_monthly_usage.import_count + 1,
+                recovered_questions = ai_monthly_usage.recovered_questions + EXCLUDED.recovered_questions,
+                updated_at = NOW()
+            """,
+            user_id,
+            max(0, int(recovered_questions)),
+        )
+
+
+async def grant_pro(
+    user_id: int,
+    days: int,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None,
+) -> None:
+    """Grant/extend Pro from now for manual testing/activation."""
+    if not _POOL:
+        raise RuntimeError("Database is disabled")
+
+    days = max(1, int(days))
+    await ensure_user(user_id, username, full_name)
+
+    async with _POOL.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET plan='pro',
+                pro_expires_at=GREATEST(
+                    COALESCE(pro_expires_at, NOW()),
+                    NOW()
+                ) + ($2::text || ' days')::interval,
+                updated_at=NOW()
+            WHERE telegram_id=$1
+            """,
+            user_id,
+            days,
+        )
+
+
+async def revoke_pro(user_id: int) -> None:
+    if not _POOL:
+        raise RuntimeError("Database is disabled")
+
+    async with _POOL.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET plan='free',
+                pro_expires_at=NULL,
+                updated_at=NOW()
+            WHERE telegram_id=$1
+            """,
+            user_id,
+        )
