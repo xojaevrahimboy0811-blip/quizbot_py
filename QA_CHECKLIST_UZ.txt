@@ -1,0 +1,81 @@
+TESTCHI PRO — PRE-PAYMENT QA CHECKLIST
+
+A. INFRA
+[ ] /health -> telegram_mode=webhook, telegram_app_running=true
+[ ] /start tez javob beradi
+[ ] Render log’da repeated getUpdates yo‘q
+[ ] Restartdan keyin saved quizzes bazada qoladi
+
+B. FREE REGRESSION
+[ ] Normal DOCX -> parser AI’siz ishlaydi
+[ ] Normal text PDF -> parser AI’siz ishlaydi
+[ ] Free 1 yangi import/oy
+[ ] Saved quiz reuse unlimited
+[ ] Mashq/Imtihon STARTdan oldin majburiy
+[ ] pause/resume/stop
+[ ] 3 unanswered -> private auto-pause
+[ ] progressive mistake review
+
+C. PARSER FLEX
+[ ] 1. / 1) / №1 / Savol 1
+[ ] A) / A. / A: / A-
+[ ] inline A/B/C/D
+[ ] 2–10 options
+[ ] multiline options
+[ ] Javob / Answer / Ответ
+[ ] answer key at end
+[ ] Word table
+[ ] +/*/✓ marker
+[ ] missing answer -> NO GUESS
+[ ] multiple marked answers -> warning
+
+D. KNOWN REGRESSION FILES
+[ ] AT_YAKUNIY_NAZORAT_BOT_PARSER_TEST_200.docx -> 200 ready / 0 issue
+[ ] ADABIYOTSHUNOSLIK_250_TEST_Javob_format(1).docx -> 249 ready / 2 issue / 251 total
+[ ] Yakuniy nazorat savollari 340 test.pdf -> 340 ready / 0 issue via PDF highlight-jadval parseri
+
+E. PRO SELECTION
+[ ] 🎯 button visible
+[ ] 121-170 -> exactly 50
+[ ] 190-250 on 200 -> clear invalid message
+[ ] 🎲 button visible
+[ ] 75 -> exactly 75 random questions
+[ ] > total -> clear invalid message
+[ ] same flows in group host mode
+
+F. PRO AI TEXT
+[ ] unusual text DOCX/PDF -> AI fallback starts
+[ ] AI result merges with normal-parser ready questions
+[ ] question with no marked answer is NOT solved
+[ ] /plan AI usage increments once per AI-assisted uploaded file
+
+G. PRO SCAN PDF
+[ ] image-only PDF -> AI scan path starts
+[ ] scan with marked answers -> quiz created
+[ ] scan with no marked answer -> unresolved, no guessing
+[ ] > AI_MAX_SCAN_PAGES -> clear limit message
+
+H. BOOKMARK / WEAK / STATS
+[ ] ⭐ mark question during quiz
+[ ] saved quiz -> Belgilanganlar practice
+[ ] repeated wrong items -> Zaif savollar
+[ ] repeated correct answers improve weak status
+[ ] PRO statistics update
+[ ] first vs recent trend is sensible
+
+I. SAVED QUIZ MANAGEMENT
+[ ] rename
+[ ] duplicate -> independent copy appears
+[ ] reset results -> attempts/weak reset, bookmark remains
+[ ] delete
+
+J. GROUP
+[ ] only host controls setup
+[ ] custom range/random N
+[ ] shuffle/timer/mode
+[ ] pause/resume/skip/stop/release
+[ ] nobody answers 3 -> auto-stop
+[ ] leaderboard
+
+PAYMENT GATE
+Do NOT add payment until all critical A/B/D/E/F/H/J checks pass.

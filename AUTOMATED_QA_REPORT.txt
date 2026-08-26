@@ -1,0 +1,39 @@
+TESTCHI PRO v3 — AUTOMATED LOCAL QA REPORT
+
+PASS — AT_YAKUNIY_NAZORAT_BOT_PARSER_TEST_200.docx
+       200 ready / 0 issue
+
+PASS — ADABIYOTSHUNOSLIK_250_TEST_Javob_format(1).docx
+       249 ready / 2 issue / 251 total
+       Expected unresolved: №50 no answer; №145 multiple explicit answers
+
+PASS — Yakuniy nazorat savollari 340 test.pdf
+       340 ready / 0 issue
+       Method: deterministic PDF Highlight + table geometry parser
+
+PASS — flexible synthetic format
+       Savol/Question/Russian Ответ, inline A/B/C/D, A-/A., exact answer text,
+       answer-key section
+
+PASS — custom range parser
+       121-170 on 200 -> (121,170)
+
+PASS — random count
+       75 on 200 -> 75; 250 on 200 -> rejected
+
+PASS — scanned PDF batching logic
+       32-page QA PDF -> 4 batches at 8 pages/batch
+
+PASS — Python syntax compilation for:
+       bot.py, api.py, database_quiz.py, ai_parser.py, parser_engine.py,
+       pro_features.py
+
+PASS — webhook static check
+       run_polling absent; set_webhook present
+
+NOT TESTED LOCALLY
+- Real Gemini network calls (internet/API access is unavailable in this build environment)
+- Telegram end-to-end button/poll behavior after deploy
+- Render PostgreSQL live migrations after deploy
+
+These must be tested by the owner on Render before payments are enabled.

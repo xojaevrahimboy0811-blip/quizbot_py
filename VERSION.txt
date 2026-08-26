@@ -1,0 +1,3 @@
+Testchi PRO v3 PRE-PAYMENT COMPLETE
+Payments: NOT ENABLED
+Build focus: feature completion + parser flexibility + scan PDF + QA
