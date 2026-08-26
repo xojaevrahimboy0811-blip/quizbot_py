@@ -1852,6 +1852,26 @@ async def help_ai_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def help_parser_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "🧪 PARSER QANDAY ISHLAYDI?\n\n"
+        "1) Bot avval oddiy parser bilan savol bloklarini topadi.\n"
+        "2) Savol matni va 2–10 ta variantni ajratadi.\n"
+        "3) Faqat manbada aniq ko‘rsatilgan to‘g‘ri javobni qabul qiladi.\n"
+        "4) Javoblar hujjat oxiridagi kalitda bo‘lsa, ularni moslashtirishga urinadi.\n"
+        "5) Word jadvallari va haqiqiy PDF highlight belgilari ham tekshiriladi.\n"
+        "6) Noaniq savollar muammoli deb hisobotda ko‘rsatiladi.\n"
+        "7) 👑 PRO da oddiy parser yetarli bo‘lmasa AI fallback ishlaydi.\n\n"
+        "⚠️ Bot to‘g‘ri javobni taxmin qilmaydi.\n\n"
+        "/parser — joriy yuklangan test bo‘yicha parser hisobotini ko‘rish.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("← Yordam", callback_data="menu_help")]]
+        ),
+    )
+
+
 async def pro_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
