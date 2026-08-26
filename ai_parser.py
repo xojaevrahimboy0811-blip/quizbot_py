@@ -2,15 +2,21 @@ import os
 import re
 import json
 import logging
+import base64
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from pypdf import PdfReader, PdfWriter
 
 
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or "").strip()
 AI_CHUNK_CHARS = int(os.environ.get("AI_CHUNK_CHARS", "12000"))
 AI_TIMEOUT_SECONDS = float(os.environ.get("AI_TIMEOUT_SECONDS", "70"))
+
+AI_PDF_PAGES_PER_BATCH = int(os.environ.get("AI_PDF_PAGES_PER_BATCH", "8"))
+AI_MAX_SCAN_PAGES = int(os.environ.get("AI_MAX_SCAN_PAGES", "50"))
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -540,3 +546,221 @@ async def recover_questions(
         "batches": successful_batches,
         "ai_called": ai_called,
     }
+
+# ---------------------------------------------------------------------------
+# Scanned / image-only PDF recovery (PRO)
+# ---------------------------------------------------------------------------
+def _scan_prompt() -> str:
+    return """
+You are a STRICT OCR + TEST-STRUCTURE EXTRACTOR for a scanned PDF.
+
+TASK:
+Read the visible PDF pages, transcribe the relevant test text, and extract
+multiple-choice questions.
+
+CRITICAL RULES:
+1. NEVER solve a test question using your own knowledge.
+2. NEVER infer or invent a correct answer.
+3. A correct answer is allowed ONLY when the visible source explicitly marks it
+   using an answer line/key, highlight/check/star/plus, bold/underline that is
+   clearly used as the answer marker, or another explicit visual indication.
+4. If the correct answer is not visibly proven, status MUST be "unknown" and
+   correct_label/answer_evidence MUST be null.
+5. If more than one answer is marked and the question is not clearly multi-select,
+   status MUST be "ambiguous".
+6. Preserve wording. Only normalize whitespace and remove numbering punctuation.
+7. answer_evidence MUST be a SHORT exact substring that also appears verbatim in
+   your own transcribed_text. Never paraphrase it.
+8. Do not output prose outside JSON.
+
+RETURN ONLY:
+{
+  "transcribed_text": "the visible test text from these pages",
+  "questions": [
+    {
+      "source_number": 1,
+      "question": "question text",
+      "options": [
+        {"label": "A", "text": "option"},
+        {"label": "B", "text": "option"}
+      ],
+      "correct_label": "B",
+      "answer_evidence": "Javob: B",
+      "status": "ready"
+    }
+  ]
+}
+
+Allowed status: ready, unknown, ambiguous.
+""".strip()
+
+
+def _split_pdf_batches(data: bytes) -> List[bytes]:
+    try:
+        reader = PdfReader(BytesIO(data))
+    except Exception as exc:
+        raise AIParserError("AI_PDF_INVALID") from exc
+
+    page_count = len(reader.pages)
+    if page_count <= 0:
+        raise AIParserError("AI_PDF_EMPTY")
+    if page_count > AI_MAX_SCAN_PAGES:
+        raise AIParserError(f"AI_SCAN_PAGE_LIMIT:{page_count}:{AI_MAX_SCAN_PAGES}")
+
+    batch_size = max(1, AI_PDF_PAGES_PER_BATCH)
+    batches: List[bytes] = []
+    for start in range(0, page_count, batch_size):
+        writer = PdfWriter()
+        for page in reader.pages[start:start + batch_size]:
+            writer.add_page(page)
+        buf = BytesIO()
+        writer.write(buf)
+        batches.append(buf.getvalue())
+    return batches
+
+
+async def _call_pdf_model(
+    client: httpx.AsyncClient,
+    model: str,
+    pdf_bytes: bytes,
+) -> Dict[str, Any]:
+    url = f"{API_ROOT}/models/{model}:generateContent"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": _scan_prompt()},
+                    {
+                        "inline_data": {
+                            "mime_type": "application/pdf",
+                            "data": base64.b64encode(pdf_bytes).decode("ascii"),
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    response = await client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
+    if response.status_code in (400, 404):
+        raise AIParserError(f"MODEL_UNAVAILABLE:{model}:{response.status_code}")
+    if response.status_code == 429:
+        raise AIParserError("AI_QUOTA")
+    if response.status_code >= 500:
+        raise AIParserError(f"AI_PROVIDER_{response.status_code}")
+    response.raise_for_status()
+    data = response.json()
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(part.get("text", "") for part in parts)
+        return json.loads(_extract_json_text(text))
+    except Exception as exc:
+        raise AIParserError("AI_INVALID_JSON") from exc
+
+
+async def recover_scanned_pdf(data: bytes) -> Dict[str, Any]:
+    """
+    Recover questions from an image-only/scanned PDF with Gemini multimodal input.
+
+    Safety model:
+      PDF image -> Gemini transcription + structured extraction -> code verifies
+      answer_evidence exists verbatim in Gemini's transcription. Questions with
+      no explicit evidence remain unresolved; the model is never asked to solve.
+    """
+    if not GEMINI_API_KEY:
+        raise AIParserError("AI_NOT_CONFIGURED")
+
+    batches = _split_pdf_batches(data)
+    timeout = httpx.Timeout(max(AI_TIMEOUT_SECONDS, 90.0))
+    recovered: List[dict] = []
+    unresolved: List[str] = []
+    transcriptions: List[str] = []
+    model_used: Optional[str] = None
+    successful_batches = 0
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        models = await _candidate_models(client)
+        if not models:
+            raise AIParserError("AI_MODEL_NOT_FOUND")
+
+        active_model: Optional[str] = None
+        for batch_index, pdf_batch in enumerate(batches, start=1):
+            payload: Optional[Dict[str, Any]] = None
+            last_error: Optional[Exception] = None
+            try_models = [active_model] if active_model else models
+
+            for model in [m for m in try_models if m]:
+                try:
+                    payload = await _call_pdf_model(client, model, pdf_batch)
+                    active_model = model
+                    model_used = model
+                    break
+                except AIParserError as exc:
+                    last_error = exc
+                    if str(exc).startswith("MODEL_UNAVAILABLE:"):
+                        continue
+                    raise
+
+            if payload is None:
+                discovered = await _list_generate_models(client)
+                for model in discovered:
+                    if model in models:
+                        continue
+                    try:
+                        payload = await _call_pdf_model(client, model, pdf_batch)
+                        active_model = model
+                        model_used = model
+                        break
+                    except AIParserError as exc:
+                        last_error = exc
+                        if str(exc).startswith("MODEL_UNAVAILABLE:"):
+                            continue
+                        raise
+
+            if payload is None:
+                if last_error:
+                    raise last_error
+                raise AIParserError("AI_MODEL_NOT_FOUND")
+
+            successful_batches += 1
+            transcript = str(payload.get("transcribed_text") or "").strip()
+            transcriptions.append(transcript)
+            raw_questions = payload.get("questions")
+            if not isinstance(raw_questions, list):
+                unresolved.append(f"AI scan: {batch_index}-bo‘lakdan savollar olinmadi")
+                continue
+
+            for item in raw_questions:
+                if not isinstance(item, dict):
+                    unresolved.append("AI scan: noto‘g‘ri savol tuzilishi")
+                    continue
+                ready, warning = _validate_item(item, transcript)
+                if ready:
+                    recovered.append(ready)
+                elif warning:
+                    unresolved.append(warning)
+
+    unique: List[dict] = []
+    seen = set()
+    for item in recovered:
+        fp = _question_fingerprint(item)
+        if fp and fp not in seen:
+            unique.append(item)
+            seen.add(fp)
+
+    return {
+        "questions": unique,
+        "warnings": unresolved,
+        "transcribed_text": "\n\n".join(x for x in transcriptions if x),
+        "model": model_used,
+        "batches": successful_batches,
+        "ai_called": bool(successful_batches),
+        "source_mode": "scanned_pdf",
+    }
+
