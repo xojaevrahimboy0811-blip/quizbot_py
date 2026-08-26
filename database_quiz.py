@@ -1042,32 +1042,82 @@ async def duplicate_quiz(owner_id: int, quiz_id: int) -> Optional[Dict[str, Any]
     return {"quiz_id": int(new_id), "name": new_name, "source_filename": source_filename}
 
 
-async def reset_quiz_progress(user_id: int, quiz_id: int, keep_bookmarks: bool = True) -> bool:
-    """Reset attempt/per-question learning history for one owned quiz."""
+async def reset_quiz_progress(
+    user_id: int,
+    quiz_id: int,
+    keep_bookmarks: bool = True,
+    verify: bool = False,
+):
+    """
+    Reset attempt/per-question learning history for one owned quiz.
+
+    With verify=True returns:
+      {"ok": bool, "attempts": 0, "performance": 0, "bookmarks": N}
+    Otherwise returns a legacy boolean.
+    """
     if not _POOL:
-        return False
+        return {"ok": False} if verify else False
+
     async with _POOL.acquire() as conn:
         async with conn.transaction():
             owned = await conn.fetchval(
                 "SELECT 1 FROM quizzes WHERE id=$1 AND owner_id=$2",
-                quiz_id, user_id,
+                quiz_id,
+                user_id,
             )
             if not owned:
-                return False
+                return {"ok": False} if verify else False
+
             await conn.execute(
                 "DELETE FROM attempts WHERE user_id=$1 AND quiz_id=$2",
-                user_id, quiz_id,
+                user_id,
+                quiz_id,
             )
             await conn.execute(
                 "DELETE FROM question_performance WHERE user_id=$1 AND quiz_id=$2",
-                user_id, quiz_id,
+                user_id,
+                quiz_id,
             )
+
             if not keep_bookmarks:
                 await conn.execute(
                     "DELETE FROM question_bookmarks WHERE user_id=$1 AND quiz_id=$2",
-                    user_id, quiz_id,
+                    user_id,
+                    quiz_id,
                 )
-    return True
+
+            attempts_left = int(await conn.fetchval(
+                "SELECT COUNT(*) FROM attempts WHERE user_id=$1 AND quiz_id=$2",
+                user_id,
+                quiz_id,
+            ) or 0)
+            performance_left = int(await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM question_performance
+                WHERE user_id=$1 AND quiz_id=$2
+                """,
+                user_id,
+                quiz_id,
+            ) or 0)
+            bookmarks_left = int(await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM question_bookmarks
+                WHERE user_id=$1 AND quiz_id=$2
+                """,
+                user_id,
+                quiz_id,
+            ) or 0)
+
+    ok = attempts_left == 0 and performance_left == 0
+
+    if verify:
+        return {
+            "ok": ok,
+            "attempts": attempts_left,
+            "performance": performance_left,
+            "bookmarks": bookmarks_left,
+        }
+    return ok
 
 
 async def get_quiz_progress_trend(user_id: int, quiz_id: int) -> Dict[str, Any]:
