@@ -980,21 +980,74 @@ async def private_reset_stats_callback(update: Update, context: ContextTypes.DEF
 
 async def private_reset_stats_yes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not await user_has_pro(update.effective_user.id):
+    user_id = update.effective_user.id
+
+    if not await user_has_pro(user_id):
         await query.answer("Bu PRO funksiyasi.", show_alert=True)
         return
     await query.answer()
+
     quiz_id = int(query.data.split(":")[1])
+
     try:
-        ok = await db.reset_quiz_progress(update.effective_user.id, quiz_id, keep_bookmarks=True)
+        reset_info = await db.reset_quiz_progress(
+            user_id,
+            quiz_id,
+            keep_bookmarks=True,
+            verify=True,
+        )
     except Exception:
         logging.exception("Reset quiz progress failed")
-        ok = False
-    await query.message.reply_text(
-        "✅ Natijalar va zaif-savol tarixi tozalandi. Belgilangan savollar saqlandi."
-        if ok else "❌ Natijalarni tozalab bo‘lmadi.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")]]),
-    )
+        reset_info = {"ok": False}
+
+    if not reset_info.get("ok"):
+        await query.message.reply_text(
+            "❌ Natijalarni tozalab bo‘lmadi. Ma’lumotlar bazasi o‘zgarishlarni "
+            "tasdiqlamadi."
+        )
+        return
+
+    # Remove stale in-memory result/weak caches for the currently loaded quiz.
+    session = USER_DATA.get(user_id)
+    if session and session.get("saved_quiz_id") and int(session["saved_quiz_id"]) == quiz_id:
+        session["results"] = {}
+        session.pop("special_mode", None)
+
+    context.user_data.pop(f"weak_positions:{quiz_id}", None)
+
+    # Delete previously generated statistics summary messages from this chat.
+    stats_key = f"stats_message_ids:{quiz_id}"
+    old_message_ids = context.user_data.pop(stats_key, [])
+    for message_id in old_message_ids:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=message_id,
+            )
+        except Exception:
+            pass
+
+    # Replace the confirmation card itself so there is no stale "are you sure?" UI.
+    try:
+        await query.edit_message_text(
+            "✅ Natijalar tozalandi.\n\n"
+            "Urinishlar: 0\n"
+            "Zaif-savol tarixi: 0\n"
+            "⭐ Belgilangan savollar saqlandi.\n\n"
+            "Quyidagi tugma bazadan yangidan hisoblangan statistikani ochadi.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Yangilangan statistika", callback_data=f"presults:{quiz_id}")],
+                [InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")],
+            ]),
+        )
+    except Exception:
+        await query.message.reply_text(
+            "✅ Natijalar tozalandi. Urinishlar va zaif-savol tarixi 0 ga tushirildi.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Yangilangan statistika", callback_data=f"presults:{quiz_id}")],
+                [InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")],
+            ]),
+        )
 
 
 async def private_rename_quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1121,7 +1174,15 @@ async def private_quiz_results_callback(update: Update, context: ContextTypes.DE
                   InlineKeyboardButton("⭐ Belgilanganlar", callback_data=f"pbookmarks:{quiz_id}")]]
     rows += [[InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")],
              [InlineKeyboardButton("📚 Testlarim", callback_data="menu_quizzes")]]
-    await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+    sent = await query.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    key = f"stats_message_ids:{quiz_id}"
+    ids = context.user_data.setdefault(key, [])
+    ids.append(sent.message_id)
+    # Keep the list bounded.
+    context.user_data[key] = ids[-20:]
 
 
 def _questions_by_positions(quiz: dict, positions: List[int]) -> List[dict]:
@@ -1235,23 +1296,33 @@ async def bookmarks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Bu PRO funksiyasi.", show_alert=True)
         return
     await query.answer()
+
     quiz_id = int(query.data.split(":")[1])
     quiz = await db.load_quiz(update.effective_user.id, quiz_id)
     if not quiz:
         await query.message.reply_text("❌ Test topilmadi.")
         return
+
     positions = await db.list_bookmark_positions(update.effective_user.id, quiz_id)
     if not positions:
         await query.message.reply_text(
             "⭐ Hozircha belgilangan savol yo‘q.\n\n"
-            "PRO test ishlayotganda savol ostidagi ⭐ Belgilash tugmasini bosing.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")]]),
+            "PRO test ishlayotganda savol ostidagi ⭐ Keyin ko‘rish tugmasini bosing. "
+            "Tugma savolga javob berganingizdan keyin ham qoladi.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")]
+            ]),
         )
         return
+
+    text = bookmark_preview_text(quiz, positions)
     await query.message.reply_text(
-        f"⭐ Belgilangan savollar: {len(positions)} ta",
+        text,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Belgilanganlarni mashq qilish", callback_data=f"pbookstart:{quiz_id}")],
+            [InlineKeyboardButton(
+                f"▶️ Barcha {len(positions)} ta belgilangan savolni mashq qilish",
+                callback_data=f"pbookstart:{quiz_id}",
+            )],
             [InlineKeyboardButton("← Testga qaytish", callback_data=f"pquiz:{quiz_id}")],
         ]),
     )
@@ -3090,6 +3161,67 @@ def telegram_safe_option(text: str) -> str:
     return text[:95] if len(text) > 95 else text
 
 
+def private_bookmark_markup(session: dict, active: dict, item: dict) -> Optional[InlineKeyboardMarkup]:
+    """Build the persistent bookmark keyboard for one private Pro poll."""
+    if not active.get("pro_features") or not session.get("saved_quiz_id"):
+        return None
+
+    try:
+        position = int(item.get("position") or 0)
+        quiz_id = int(session["saved_quiz_id"])
+        run_id = int(active["run_id"])
+    except Exception:
+        return None
+
+    if position <= 0:
+        return None
+
+    marked = position in active.get("bookmarked_positions", set())
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🌟 Belgilangan" if marked else "⭐ Keyin ko‘rish",
+            callback_data=f"pbookmarktoggle:{quiz_id}:{run_id}:{position}",
+        )
+    ]])
+
+
+def bookmark_preview_text(quiz: dict, positions: List[int], max_chars: int = 3300) -> str:
+    """Show the actual bookmarked questions while staying under Telegram limits."""
+    by_pos = {
+        int(q.get("position") or 0): q
+        for q in quiz.get("questions", [])
+        if int(q.get("position") or 0) > 0
+    }
+
+    lines = [f"⭐ Belgilangan savollar: {len(positions)} ta", ""]
+    shown = 0
+
+    for pos in positions:
+        q = by_pos.get(int(pos))
+        if not q:
+            continue
+
+        question = re.sub(r"\s+", " ", str(q.get("question") or "")).strip()
+        if len(question) > 180:
+            question = question[:177].rstrip() + "..."
+
+        source_no = q.get("number") or pos
+        line = f"⭐ {source_no}. {question}"
+
+        projected = "\n\n".join(lines + [line])
+        if len(projected) > max_chars:
+            break
+
+        lines.append(line)
+        shown += 1
+
+    remaining = max(0, len(positions) - shown)
+    if remaining:
+        lines += ["", f"… yana {remaining} ta belgilangan savol."]
+
+    return "\n\n".join(lines)
+
+
 async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     session = USER_DATA.get(user_id)
     if not session or not session.get("active"):
@@ -3130,15 +3262,9 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
             poll_kwargs["type"] = "quiz"
             poll_kwargs["correct_option_id"] = displayed_correct_index
 
-        position = int(item.get("position") or 0)
-        if active.get("pro_features") and session.get("saved_quiz_id") and position > 0:
-            marked = position in active.get("bookmarked_positions", set())
-            poll_kwargs["reply_markup"] = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "🌟 Belgilangan" if marked else "⭐ Belgilash",
-                    callback_data=f"pbookmarktoggle:{int(session['saved_quiz_id'])}:{active['run_id']}:{position}",
-                )
-            ]])
+        bookmark_markup = private_bookmark_markup(session, active, item)
+        if bookmark_markup is not None:
+            poll_kwargs["reply_markup"] = bookmark_markup
         msg = await context.bot.send_poll(**poll_kwargs)
     except Exception:
         logging.exception("Could not send poll")
@@ -3163,6 +3289,8 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
         "question_index": idx,
         "run_id": active["run_id"],
         "poll_correct_index": displayed_correct_index,
+        "bookmark_position": int(item.get("position") or 0),
+        "quiz_id": int(session["saved_quiz_id"]) if session.get("saved_quiz_id") else None,
         "handled": False,
     }
 
@@ -3185,48 +3313,59 @@ async def send_next_question(chat_id: int, user_id: int, context: ContextTypes.D
 async def bookmark_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
+
     if not await user_has_pro(user_id):
         await query.answer("Bu PRO funksiyasi.", show_alert=True)
         return
-
-    session = USER_DATA.get(user_id)
-    if not session or not session.get("saved_quiz_id"):
-        await query.answer("Saqlangan test topilmadi.", show_alert=True)
+    if not db.is_enabled():
+        await query.answer("Database ulanmagan.", show_alert=True)
         return
 
     _, quiz_text, run_text, pos_text = query.data.split(":")
     quiz_id = int(quiz_text)
     position = int(pos_text)
-    active = session.get("active")
-    if active and active.get("run_id") != int(run_text):
-        # Old poll cards can still toggle a bookmark safely; ownership is checked in DB.
-        pass
 
+    # Do NOT require the old quiz to still be active in RAM.
+    # Ownership and validity are checked by the persistent database.
     try:
         marked = await db.toggle_bookmark(user_id, quiz_id, position)
     except Exception:
         logging.exception("Bookmark toggle failed")
-        await query.answer("Bookmarkni saqlab bo‘lmadi.", show_alert=True)
+        await query.answer("Belgilashni saqlab bo‘lmadi.", show_alert=True)
         return
 
-    if active:
+    # Keep current active-session state in sync only when it is the same saved quiz.
+    session = USER_DATA.get(user_id)
+    active = session.get("active") if session else None
+    if (
+        active
+        and session.get("saved_quiz_id")
+        and int(session["saved_quiz_id"]) == quiz_id
+    ):
         marks = active.setdefault("bookmarked_positions", set())
         if marked:
             marks.add(position)
         else:
             marks.discard(position)
 
-    await query.answer("⭐ Saqlandi" if marked else "⭐ Olib tashlandi")
+    await query.answer(
+        "⭐ Keyin ko‘rish uchun saqlandi"
+        if marked else
+        "⭐ Belgilanganlardan olib tashlandi"
+    )
+
     try:
         await query.edit_message_reply_markup(
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    "🌟 Belgilangan" if marked else "⭐ Belgilash",
+                    "🌟 Belgilangan" if marked else "⭐ Keyin ko‘rish",
                     callback_data=f"pbookmarktoggle:{quiz_id}:{run_text}:{position}",
                 )
             ]])
         )
     except Exception:
+        # A closed/old poll may reject markup edits on some Telegram clients.
+        # The bookmark is already safely persisted in DB.
         pass
 
 
@@ -3378,9 +3517,18 @@ async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     message_id = meta.get("message_id")
     if message_id:
         try:
-            await context.bot.stop_poll(meta["chat_id"], message_id)
+            persistent_markup = private_bookmark_markup(session, active, item)
+            await context.bot.stop_poll(
+                meta["chat_id"],
+                message_id,
+                reply_markup=persistent_markup,
+            )
         except Exception:
-            pass
+            logging.exception("Answered poll could not be stopped with bookmark keyboard")
+            try:
+                await context.bot.stop_poll(meta["chat_id"], message_id)
+            except Exception:
+                pass
     active["current_poll_id"] = None
     active["current_poll_message_id"] = None
     POLL_MAP.pop(answer.poll_id, None)
@@ -4286,9 +4434,18 @@ async def stop_group_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if message_id:
             try:
-                await context.bot.stop_poll(chat_id, message_id)
+                current_item = (
+                    active["questions"][active["current"]]
+                    if 0 <= active.get("current", -1) < len(active.get("questions", []))
+                    else None
+                )
+                markup = private_bookmark_markup(session, active, current_item) if current_item else None
+                await context.bot.stop_poll(chat_id, message_id, reply_markup=markup)
             except Exception:
-                pass
+                try:
+                    await context.bot.stop_poll(chat_id, message_id)
+                except Exception:
+                    pass
 
         active["current_poll_id"] = None
         active["current_poll_message_id"] = None
@@ -4365,9 +4522,18 @@ async def pause_quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             POLL_MAP.pop(poll_id, None)
         if message_id:
             try:
-                await context.bot.stop_poll(chat_id, message_id)
+                current_item = (
+                    active["questions"][active["current"]]
+                    if 0 <= active.get("current", -1) < len(active.get("questions", []))
+                    else None
+                )
+                markup = private_bookmark_markup(session, active, current_item) if current_item else None
+                await context.bot.stop_poll(chat_id, message_id, reply_markup=markup)
             except Exception:
-                pass
+                try:
+                    await context.bot.stop_poll(chat_id, message_id)
+                except Exception:
+                    pass
 
         # The interrupted question is not counted; it will be sent again on resume.
         active["current_poll_id"] = None
